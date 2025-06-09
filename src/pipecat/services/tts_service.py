@@ -274,8 +274,8 @@ class TTSService(AIService):
 
         # Process all filter.
         for filter in self._text_filters:
-            await filter.reset_interruption()
-            text = await filter.filter(text)
+            filter.reset_interruption()
+            text = filter.filter(text)
 
         if text:
             await self.process_generator(self.run_tts(text))

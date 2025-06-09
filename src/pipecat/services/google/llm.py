@@ -30,6 +30,7 @@ from pipecat.frames.frames import (
     LLMUpdateSettingsFrame,
     UserImageRawFrame,
     VisionImageRawFrame,
+    LLMSearchResponseFrame,
 )
 from pipecat.metrics.metrics import LLMTokenUsage
 from pipecat.processors.aggregators.llm_response import (
@@ -41,7 +42,6 @@ from pipecat.processors.aggregators.openai_llm_context import (
     OpenAILLMContextFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
-from pipecat.services.google.frames import LLMSearchResponseFrame
 from pipecat.services.llm_service import FunctionCallFromLLM, LLMService
 from pipecat.services.openai.llm import (
     OpenAIAssistantContextAggregator,
@@ -61,8 +61,11 @@ try:
         FunctionCall,
         FunctionResponse,
         GenerateContentConfig,
+        ThinkingConfig,
         Part,
     )
+    from google.genai import types
+
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
     logger.error("In order to use Google AI, you need to `pip install pipecat-ai[google]`.")
@@ -512,7 +515,6 @@ class GoogleLLMService(LLMService):
 
         try:
             logger.debug(
-                # f"{self}: Generating chat [{self._system_instruction}] | [{context.get_messages_for_logging()}]"
                 f"{self}: Generating chat [{context.get_messages_for_logging()}]"
             )
 
@@ -522,15 +524,14 @@ class GoogleLLMService(LLMService):
                 self._system_instruction = context.system_message
 
             tools = []
-            if context.tools:
+            if context.tools and hasattr(context.tools, 'standard_tools'):
+                tools = context.tools.standard_tools
+            elif context.tools:
                 tools = context.tools
-            elif self._tools:
-                tools = self._tools
-            tool_config = None
-            if self._tool_config:
-                tool_config = self._tool_config
-
-            # Filter out None values and create GenerationContentConfig
+            thinking_disabled_config = ThinkingConfig()
+            #thinking_disabled_config.include_thoughts = False
+            #thinking_disabled_config.thinking_budget = 0
+            # Set up generation parameters
             generation_params = {
                 k: v
                 for k, v in {
@@ -540,7 +541,8 @@ class GoogleLLMService(LLMService):
                     "top_k": self._settings["top_k"],
                     "max_output_tokens": self._settings["max_tokens"],
                     "tools": tools,
-                    "tool_config": tool_config,
+                    "tool_config": self._tool_config,
+                    #"gemini_thinkinking_config": thinking_disabled_config
                 }.items()
                 if v is not None
             }
@@ -550,15 +552,15 @@ class GoogleLLMService(LLMService):
             )
 
             await self.start_ttfb_metrics()
-            response = await self._client.aio.models.generate_content_stream(
+            response = self._client.models.generate_content_stream(
                 model=self._model_name,
                 contents=messages,
                 config=generation_config,
             )
             await self.stop_ttfb_metrics()
-
+            logger.info(f"Response: {response}")
             function_calls = []
-            async for chunk in response:
+            for chunk in response:
                 if chunk.usage_metadata:
                     prompt_tokens += chunk.usage_metadata.prompt_token_count or 0
                     completion_tokens += chunk.usage_metadata.candidates_token_count or 0

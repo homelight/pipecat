@@ -17,6 +17,7 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
+    Union
 )
 
 from pipecat.audio.interruptions.base_interruption_strategy import BaseInterruptionStrategy
@@ -961,3 +962,11 @@ class MixerEnableFrame(MixerControlFrame):
     """Control frame to enable or disable the mixer at runtime."""
 
     enable: bool
+
+
+@dataclass
+class LLMSearchResponseFrame(Frame):
+    """Frame containing search results from LLM."""
+    search_result: str
+    origins: List[Dict[str, Any]]
+    rendered_content: Optional[str] = None
