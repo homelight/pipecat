@@ -52,7 +52,7 @@ class PipelineRunner(BaseObject):
         if self._force_gc:
             self._gc_collect()
 
-        logger.debug(f"Runner {self} finished running {task}")
+        logger.info(f"Runner {self} finished running {task}")
 
     async def stop_when_done(self):
         logger.debug(f"Runner {self} scheduled to stop when all tasks are done")

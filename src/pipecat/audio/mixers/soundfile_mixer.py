@@ -21,7 +21,7 @@ except ModuleNotFoundError as e:
         "In order to use the soundfile mixer, you need to `pip install pipecat-ai[soundfile]`."
     )
     raise Exception(f"Missing module: {e}")
-
+import os
 
 class SoundfileMixer(BaseAudioMixer):
     """This is an audio mixer that mixes incoming audio with audio from a
@@ -103,8 +103,11 @@ class SoundfileMixer(BaseAudioMixer):
 
     def _load_sound_file(self, sound_name: str, file_name: str):
         try:
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            project_root = os.path.abspath(os.path.join(current_dir, "../../../../.."))
+            sound_path = os.path.join(project_root, file_name)
             logger.debug(f"Loading mixer sound from {file_name}")
-            sound, sample_rate = sf.read(file_name, dtype="int16")
+            sound, sample_rate = sf.read(sound_path, dtype="int16")
 
             if sample_rate == self._sample_rate:
                 audio = sound.tobytes()
