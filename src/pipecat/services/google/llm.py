@@ -504,10 +504,10 @@ class GoogleLLMService(LLMService):
         search_result = ""
 
         try:
-            logger.debug(
-                # f"{self}: Generating chat [{self._system_instruction}] | [{context.get_messages_for_logging()}]"
-                f"{self}: Generating chat [{context.get_messages_for_logging()}]"
-            )
+            #logger.debug(
+            #    # f"{self}: Generating chat [{self._system_instruction}] | [{context.get_messages_for_logging()}]"
+            #    f"{self}: Generating chat [{context.get_messages_for_logging()}]"
+            #)
 
             messages = context.messages
             if context.system_message and self._system_instruction != context.system_message:
@@ -516,6 +516,7 @@ class GoogleLLMService(LLMService):
                 self._create_client()
 
             # Filter out None values and create GenerationConfig
+
             generation_params = {
                 k: v
                 for k, v in {
@@ -538,7 +539,7 @@ class GoogleLLMService(LLMService):
             tool_config = None
             if self._tool_config:
                 tool_config = self._tool_config
-            response = await self._client.generate_content_async(
+            response = self._client.generate_content(
                 contents=messages,
                 tools=tools,
                 stream=True,
@@ -547,17 +548,17 @@ class GoogleLLMService(LLMService):
             )
             await self.stop_ttfb_metrics()
 
-            if response.usage_metadata:
-                # Use only the prompt token count from the response object
-                prompt_tokens = response.usage_metadata.prompt_token_count
-                total_tokens = prompt_tokens
+            for chunk in response:
 
-            async for chunk in response:
-                if chunk.usage_metadata:
-                    # Use only the completion_tokens from the chunks. Prompt tokens are already counted and
-                    # are repeated here.
-                    completion_tokens += chunk.usage_metadata.candidates_token_count
-                    total_tokens += chunk.usage_metadata.candidates_token_count
+                #if chunk.usage_metadata:
+                #    # Use only the prompt token count the first time we see it (prompt_token_count is repeated in all chunks)
+                #    if prompt_tokens == 0 and chunk.usage_metadata.prompt_token_count is not None:
+                #        prompt_tokens = chunk.usage_metadata.prompt_token_count
+                #        total_tokens += prompt_tokens
+                #    # Accumulate completion tokens
+                # Accumulate completion tokens
+                #completion_tokens += chunk.usage_metadata.candidates_token_count
+                #total_tokens += chunk.usage_metadata.candidates_token_count
                 try:
                     for c in chunk.parts:
                         if c.text:
