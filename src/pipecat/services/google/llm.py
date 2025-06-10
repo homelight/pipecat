@@ -516,6 +516,7 @@ class GoogleLLMService(LLMService):
                 self._create_client()
 
             # Filter out None values and create GenerationConfig
+
             generation_params = {
                 k: v
                 for k, v in {
@@ -548,7 +549,7 @@ class GoogleLLMService(LLMService):
             await self.stop_ttfb_metrics()
 
             for chunk in response:
-                logger.info("chunk: " + str(chunk))
+
                 #if chunk.usage_metadata:
                 #    # Use only the prompt token count the first time we see it (prompt_token_count is repeated in all chunks)
                 #    if prompt_tokens == 0 and chunk.usage_metadata.prompt_token_count is not None:
