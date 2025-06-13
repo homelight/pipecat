@@ -34,7 +34,7 @@ from pipecat.transports.base_transport import BaseTransport, TransportParams
 
 try:
     from fastapi import WebSocket
-    from starlette.websockets import WebSocketState
+    from starlette.websockets import WebSocketDisconnect, WebSocketState
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
     logger.error(
@@ -81,9 +81,10 @@ class FastAPIWebsocketClient:
         if self._leave_counter > 0:
             return
 
-        if self.is_connected and not self.is_closing:
+        if not self.is_closing:
             self._closing = True
-            await self._websocket.close()
+            if self.is_connected:
+                await self._websocket.close()
             await self.trigger_client_disconnected()
 
     async def trigger_client_disconnected(self):
@@ -212,7 +213,6 @@ class FastAPIWebsocketOutputTransport(BaseOutputTransport):
 
     async def cancel(self, frame: CancelFrame):
         await super().cancel(frame)
-        await self._write_frame(frame)
         await self._client.disconnect()
 
     async def cleanup(self):
@@ -264,16 +264,23 @@ class FastAPIWebsocketOutputTransport(BaseOutputTransport):
         await self._write_audio_sleep()
 
     async def _write_frame(self, frame: Frame):
+        if self._client.is_closing:
+            return
+
         try:
             payload = await self._params.serializer.serialize(frame)
             if payload:
                 await self._client.send(payload)
-        except Exception as e:
+        except (WebSocketDisconnect, RuntimeError) as e:
             msg = str(e).lower()
-            if "cannot call" in msg and "once a close message has been sent" in msg:
-                logger.info(f"{self} detected closed websocket, shutting down pipeline")
-                await self.cancel(CancelFrame())
+            if (
+                "cannot call" in msg and "once a close message has been sent" in msg
+            ) or isinstance(e, WebSocketDisconnect):
+                if not self._client.is_closing:
+                    logger.info(f"{self} detected closed websocket, shutting down pipeline")
+                    await self._client.disconnect()
                 return
+
             # Otherwise, log as before
             logger.error(f"{self} exception sending data: {e.__class__.__name__} ({e})")
 

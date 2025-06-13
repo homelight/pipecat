@@ -171,7 +171,7 @@ class TTSService(AIService):
         elif isinstance(frame, StartInterruptionFrame):
             await self._handle_interruption(frame, direction)
             await self.push_frame(frame, direction)
-        elif isinstance(frame, (LLMFullResponseEndFrame, EndFrame)):
+        elif isinstance(frame, LLMFullResponseEndFrame):
             # We pause processing incoming frames if the LLM response included
             # text (it might be that it's only a function calling response). We
             # pause to avoid audio overlapping.
@@ -181,11 +181,18 @@ class TTSService(AIService):
             self._text_aggregator.reset()
             self._processing_text = False
             await self._push_tts_frames(sentence)
-            if isinstance(frame, LLMFullResponseEndFrame):
-                if self._push_text_frames:
-                    await self.push_frame(frame, direction)
-            else:
+            if self._push_text_frames:
                 await self.push_frame(frame, direction)
+        elif isinstance(frame, EndFrame):
+            # We pause processing incoming frames if the LLM response included
+            # text (it might be that it's only a function calling response). We
+            # pause to avoid audio overlapping.
+            await self._maybe_pause_frame_processing()
+
+            self._text_aggregator.reset()
+            self._processing_text = False
+            await self.flush_audio()
+            await self.push_frame(frame, direction)
         elif isinstance(frame, TTSSpeakFrame):
             # Store if we were processing text or not so we can set it back.
             processing_text = self._processing_text
