@@ -7,6 +7,7 @@
 import asyncio
 from abc import abstractmethod
 from typing import Any, AsyncGenerator, Dict, List, Mapping, Optional, Sequence, Tuple
+import re
 
 from loguru import logger
 
@@ -269,8 +270,15 @@ class TTSService(AIService):
             filter.reset_interruption()
             text = filter.filter(text)
 
-        if text:
-            await self.process_generator(self.run_tts(text))
+        if text and text.strip():
+            # Additional check: ensure text contains at least one alphanumeric character
+            # This prevents sending text that's only punctuation (which Cartesia rejects)
+            if re.search(r'[a-zA-Z0-9]', text):
+                await self.process_generator(self.run_tts(text))
+            else:
+                logger.debug(f"Skipping TTS for text with only punctuation/whitespace: '{text}'")
+        else:
+            logger.debug(f"Skipping TTS for empty/whitespace text after filtering: '{text}'")
 
         await self.stop_processing_metrics()
 
