@@ -158,10 +158,9 @@ class FastAPIWebsocketInputTransport(BaseInputTransport):
         await self._client.disconnect()
 
     async def cancel(self, frame: CancelFrame):
-        #await super().cancel(frame)
+        await super().cancel(frame)
         await self._stop_tasks()
         await self._client.disconnect()
-        await self.cleanup()
 
     async def cleanup(self):
         await super().cleanup()
@@ -302,7 +301,9 @@ class FastAPIWebsocketOutputTransport(BaseOutputTransport):
             msg = str(e).lower()
             if "cannot call" in msg and "once a close message has been sent" in msg:
                 logger.info(f"{self} detected closed websocket, shutting down pipeline")
-                await self.cancel(CancelFrame())
+                # await self.cancel(CancelFrame())
+                await self._client.disconnect()
+                await self.cleanup()
                 return
             # Otherwise, log as before
             logger.error(f"{self} exception sending data: {e.__class__.__name__} ({e})")
