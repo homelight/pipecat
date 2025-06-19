@@ -11,6 +11,7 @@ import time
 import typing
 import wave
 from typing import Awaitable, Callable, Optional
+import re
 
 from loguru import logger
 from pydantic import BaseModel
@@ -157,9 +158,10 @@ class FastAPIWebsocketInputTransport(BaseInputTransport):
         await self._client.disconnect()
 
     async def cancel(self, frame: CancelFrame):
-        await super().cancel(frame)
+        #await super().cancel(frame)
         await self._stop_tasks()
         await self._client.disconnect()
+        await self.cleanup()
 
     async def cleanup(self):
         await super().cleanup()
