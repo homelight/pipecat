@@ -126,7 +126,6 @@ class TaskObserver(BaseObserver):
                         )
                     warning_reported = True
                 await observer.on_push_frame(
-                    #data.source, data.destination, data.frame, data.direction, data.timestamp
                     data.src, data.dst, data.frame, data.direction, data.timestamp
                 )
             else:
