@@ -481,32 +481,37 @@ class BaseOutputTransport(FrameProcessor):
             TOTAL_CHUNK_MS = self._params.audio_out_10ms_chunks * 10
             BOT_SPEAKING_CHUNK_PERIOD = max(int(200 / TOTAL_CHUNK_MS), 1)
             bot_speaking_counter = 0
-            async for frame in self._next_frame():
-                # Notify the bot started speaking upstream if necessary and that
-                # it's actually speaking.
-                if isinstance(frame, TTSAudioRawFrame):
-                    await self._bot_started_speaking()
-                    if bot_speaking_counter % BOT_SPEAKING_CHUNK_PERIOD == 0:
-                        await self._transport.push_frame(BotSpeakingFrame())
-                        await self._transport.push_frame(
-                            BotSpeakingFrame(), FrameDirection.UPSTREAM
-                        )
-                        bot_speaking_counter = 0
-                    bot_speaking_counter += 1
+            try:
+                async for frame in self._next_frame():
+                    # Notify the bot started speaking upstream if necessary and that
+                    # it's actually speaking.
+                    if isinstance(frame, TTSAudioRawFrame):
+                        await self._bot_started_speaking()
+                        if bot_speaking_counter % BOT_SPEAKING_CHUNK_PERIOD == 0:
+                            await self._transport.push_frame(BotSpeakingFrame())
+                            await self._transport.push_frame(
+                                BotSpeakingFrame(), FrameDirection.UPSTREAM
+                            )
+                            bot_speaking_counter = 0
+                        bot_speaking_counter += 1
 
-                # No need to push EndFrame, it's pushed from process_frame().
-                if isinstance(frame, EndFrame):
-                    break
+                    # No need to push EndFrame, it's pushed from process_frame().
+                    if isinstance(frame, EndFrame):
+                        break
 
-                # Handle frame.
-                await self._handle_frame(frame)
+                    # Handle frame.
+                    await self._handle_frame(frame)
 
-                # Also, push frame downstream in case anyone else needs it.
-                await self._transport.push_frame(frame)
+                    # Also, push frame downstream in case anyone else needs it.
+                    await self._transport.push_frame(frame)
 
-                # Send audio.
-                if isinstance(frame, OutputAudioRawFrame):
-                    await self._transport.write_audio_frame(frame)
+                    # Send audio.
+                    if isinstance(frame, OutputAudioRawFrame):
+                        await self._transport.write_audio_frame(frame)
+            except Exception as e:
+                logger.exception(f"{self._transport} audio task error: {e}")
+                await self._bot_stopped_speaking()
+                await self._transport.push_error(ErrorFrame(str(e)))
 
         #
         # Video handling
