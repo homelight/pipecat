@@ -246,6 +246,8 @@ class TTSService(AIService):
             await self._stop_frame_queue.put(frame)
 
     async def _handle_interruption(self, frame: StartInterruptionFrame, direction: FrameDirection):
+        if self._cancelling:
+            return
         self._processing_text = False
         await self._text_aggregator.handle_interruption()
         for filter in self._text_filters:
@@ -364,6 +366,8 @@ class WordTTSService(TTSService):
 
     async def _handle_interruption(self, frame: StartInterruptionFrame, direction: FrameDirection):
         await super()._handle_interruption(frame, direction)
+        if self._cancelling:
+            return
         self._llm_response_started = False
         self.reset_word_timestamps()
 
@@ -438,6 +442,8 @@ class InterruptibleTTSService(WebsocketTTSService):
 
     async def _handle_interruption(self, frame: StartInterruptionFrame, direction: FrameDirection):
         await super()._handle_interruption(frame, direction)
+        if self._cancelling:
+            return
         if self._bot_speaking:
             await self._disconnect()
             await self._connect()
@@ -491,6 +497,8 @@ class InterruptibleWordTTSService(WebsocketWordTTSService):
 
     async def _handle_interruption(self, frame: StartInterruptionFrame, direction: FrameDirection):
         await super()._handle_interruption(frame, direction)
+        if self._cancelling:
+            return
         if self._bot_speaking:
             await self._disconnect()
             await self._connect()
@@ -573,6 +581,8 @@ class AudioContextWordTTSService(WebsocketWordTTSService):
 
     async def _handle_interruption(self, frame: StartInterruptionFrame, direction: FrameDirection):
         await super()._handle_interruption(frame, direction)
+        if self._cancelling:
+            return
         await self._stop_audio_context_task()
         self._create_audio_context_task()
 

@@ -240,6 +240,8 @@ class CartesiaTTSService(AudioContextWordTTSService):
 
     async def _handle_interruption(self, frame: StartInterruptionFrame, direction: FrameDirection):
         await super()._handle_interruption(frame, direction)
+        if self._cancelling:
+            return
         await self.stop_all_metrics()
         if self._context_id:
             cancel_msg = json.dumps({"context_id": self._context_id, "cancel": True})

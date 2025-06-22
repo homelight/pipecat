@@ -321,6 +321,8 @@ class BaseOutputTransport(FrameProcessor):
         async def handle_interruptions(self, _: StartInterruptionFrame):
             if not self._transport.interruptions_allowed:
                 return
+            if self._transport._cancelling:
+                return
 
             # Cancel tasks.
             await self._cancel_audio_task()
