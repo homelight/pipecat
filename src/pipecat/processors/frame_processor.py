@@ -293,7 +293,7 @@ class FrameProcessor(BaseObject):
 
     async def _start_interruption(self):
         if self._cancelling:
-            logger.trace(f"{self}: skipping interruption restart while cancelling")
+            logger.warning(f"{self}: skipping interruption restart while cancelling")
             return
         try:
             # Cancel the push frame task. This will stop pushing frames downstream.

@@ -107,7 +107,7 @@ class WebsocketClientSession:
             logger.error(f"{self} exception sending data: {e.__class__.__name__} ({e})")
 
     async def _client_task_handler(self):
-        backoff = 1
+        backoff = 0.5
         while self._leave_counter > 0:
             try:
                 async for message in self._websocket:
@@ -142,10 +142,10 @@ class WebsocketClientSession:
                         await asyncio.sleep(backoff)
                         self._websocket = await websockets.connect(uri=self._uri, open_timeout=10)
                         await self._callbacks.on_connected(self._websocket)
-                        backoff = 1
+                        backoff = 0.5
                     except Exception as e:
                         logger.error(f"{self} reconnect error: {e.__class__.__name__} ({e})")
-                        backoff = min(backoff * 2, 60)
+                        backoff = min(backoff * 2, 5)
 
     def __str__(self):
         return f"{self._transport_name}::WebsocketClientSession"
