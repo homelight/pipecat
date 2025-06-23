@@ -149,7 +149,8 @@ class ParallelPipeline(BasePipeline):
 
         # Handle interruptions after everything has been cancelled.
         if isinstance(frame, StartInterruptionFrame):
-            await self._handle_interruption()
+            if not self._cancelling:
+                await self._handle_interruption()
         # Wait for tasks to finish.
         elif isinstance(frame, EndFrame):
             await self._stop()

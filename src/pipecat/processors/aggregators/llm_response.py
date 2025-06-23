@@ -339,22 +339,26 @@ class LLMUserContextAggregator(LLMContextResponseAggregator):
     async def push_aggregation(self):
         """Pushes the current aggregation based on interruption strategies and conditions."""
         if len(self._aggregation) > 0:
-            if self.interruption_strategies and self._bot_speaking:
-                should_interrupt = await self._should_interrupt_based_on_strategies()
+            try:
+                if self.interruption_strategies and self._bot_speaking:
+                    should_interrupt = await self._should_interrupt_based_on_strategies()
 
-                if should_interrupt:
-                    logger.debug(
-                        "Interruption conditions met - pushing BotInterruptionFrame and aggregation"
-                    )
-                    await self.push_frame(BotInterruptionFrame(), FrameDirection.UPSTREAM)
-                    await self._process_aggregation()
+                    if should_interrupt:
+                        logger.debug(
+                            "Interruption conditions met - pushing BotInterruptionFrame and aggregation"
+                        )
+                        await self.push_frame(BotInterruptionFrame(), FrameDirection.UPSTREAM)
+                        await self._process_aggregation()
+                    else:
+                        logger.debug("Interruption conditions not met - not pushing aggregation")
+                        # Don't process aggregation, just reset it
+                        await self.reset()
                 else:
-                    logger.debug("Interruption conditions not met - not pushing aggregation")
-                    # Don't process aggregation, just reset it
-                    await self.reset()
-            else:
-                # No interruption config - normal behavior (always push aggregation)
-                await self._process_aggregation()
+                    # No interruption config - normal behavior (always push aggregation)
+                    await self._process_aggregation()
+            except Exception as e:
+                logger.exception(f"{self} push_aggregation error: {e}")
+                await self.push_error(ErrorFrame(str(e)))
 
     async def _should_interrupt_based_on_strategies(self) -> bool:
         """Check if interruption should occur based on configured strategies."""
@@ -562,15 +566,19 @@ class LLMAssistantContextAggregator(LLMContextResponseAggregator):
         aggregation = self._aggregation.strip()
         await self.reset()
 
-        if aggregation:
-            await self.handle_aggregation(aggregation)
+        try:
+            if aggregation:
+                await self.handle_aggregation(aggregation)
 
-        # Push context frame
-        await self.push_context_frame()
+            # Push context frame
+            await self.push_context_frame()
 
-        # Push timestamp frame with current time
-        timestamp_frame = OpenAILLMContextAssistantTimestampFrame(timestamp=time_now_iso8601())
-        await self.push_frame(timestamp_frame)
+            # Push timestamp frame with current time
+            timestamp_frame = OpenAILLMContextAssistantTimestampFrame(timestamp=time_now_iso8601())
+            await self.push_frame(timestamp_frame)
+        except Exception as e:
+            logger.exception(f"{self} push_aggregation error: {e}")
+            await self.push_error(ErrorFrame(str(e)))
 
     async def _handle_interruptions(self, frame: StartInterruptionFrame):
         await self.push_aggregation()

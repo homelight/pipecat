@@ -168,7 +168,8 @@ class TavusVideoService(AIService):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, StartInterruptionFrame):
-            await self._handle_interruptions()
+            if not self._cancelling:
+                await self._handle_interruptions()
             await self.push_frame(frame, direction)
         elif isinstance(frame, TTSAudioRawFrame):
             await self._queue.put(frame)
@@ -176,6 +177,8 @@ class TavusVideoService(AIService):
             await self.push_frame(frame, direction)
 
     async def _handle_interruptions(self):
+        if self._cancelling:
+            return
         await self._cancel_send_task()
         await self._create_send_task()
         await self._client.send_interrupt_message()

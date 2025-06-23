@@ -13,6 +13,7 @@ from typing import Awaitable, Callable, Optional
 import websockets
 from loguru import logger
 from pydantic.main import BaseModel
+from websockets.exceptions import ConnectionClosedOK
 
 from pipecat.frames.frames import (
     CancelFrame,
@@ -106,14 +107,45 @@ class WebsocketClientSession:
             logger.error(f"{self} exception sending data: {e.__class__.__name__} ({e})")
 
     async def _client_task_handler(self):
-        try:
-            # Handle incoming messages
-            async for message in self._websocket:
-                await self._callbacks.on_message(self._websocket, message)
-        except Exception as e:
-            logger.error(f"{self} exception receiving data: {e.__class__.__name__} ({e})")
+        backoff = 0.5
+        while self._leave_counter > 0:
+            try:
+                async for message in self._websocket:
+                    await self._callbacks.on_message(self._websocket, message)
+            except ConnectionClosedOK as e:
+                logger.info(f"{self} connection closed: {e}")
+                await self._callbacks.on_disconnected(self._websocket)
+                try:
+                    if self._websocket:
+                        await self._websocket.close()
+                except Exception:
+                    pass
+                self._websocket = None
+                break
+            except Exception as e:
+                logger.error(f"{self} exception receiving data: {e.__class__.__name__} ({e})")
+                await self._callbacks.on_disconnected(self._websocket)
 
-        await self._callbacks.on_disconnected(self._websocket)
+                try:
+                    if self._websocket:
+                        await self._websocket.close()
+                except Exception:
+                    pass
+                self._websocket = None
+
+                if self._leave_counter <= 0:
+                    break
+
+                # Reconnect with exponential backoff
+                while self._leave_counter > 0 and not self._websocket:
+                    try:
+                        await asyncio.sleep(backoff)
+                        self._websocket = await websockets.connect(uri=self._uri, open_timeout=10)
+                        await self._callbacks.on_connected(self._websocket)
+                        backoff = 0.5
+                    except Exception as e:
+                        logger.error(f"{self} reconnect error: {e.__class__.__name__} ({e})")
+                        backoff = min(backoff * 2, 5)
 
     def __str__(self):
         return f"{self._transport_name}::WebsocketClientSession"
