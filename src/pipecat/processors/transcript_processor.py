@@ -22,6 +22,9 @@ from pipecat.frames.frames import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.utils.time import time_now_iso8601
 
+import pipecat.processors.frame_processor
+print("FrameProcessor loaded from:", pipecat.processors.frame_processor.__file__)
+
 
 class BaseTranscriptProcessor(FrameProcessor):
     """Base class for processing conversation transcripts.
@@ -203,6 +206,35 @@ class AssistantTranscriptProcessor(BaseTranscriptProcessor):
             await self.push_frame(frame, direction)
         else:
             await self.push_frame(frame, direction)
+
+
+class InterruptionStrategyProcessor(FrameProcessor):
+    def __init__(self, interruption_strategies):
+        super().__init__()
+        self._interruption_strategies = interruption_strategies
+        self._started = False
+
+    async def process_frame(self, frame, direction):
+        # Always forward StartFrame downstream!
+        if frame.__class__.__name__ == "StartFrame":
+            self._started = True
+            await self.push_frame(frame, direction)
+            return
+
+        if not isinstance(frame, TranscriptionFrame):
+            await super().process_frame(frame, direction)
+            return
+
+        logger.debug(f"InterruptionStrategyProcessor received TranscriptionFrame: {frame}")
+        text = frame.text.strip()
+        if text and self._started:
+            for strategy in self._interruption_strategies:
+                await strategy.append_text(text)
+                if await strategy.should_interrupt():
+                    logger.debug("Interruption triggered by MinWordsInterruptionStrategy")
+                    await self.push_frame(StartInterruptionFrame())
+                    await strategy.reset()
+        await self.push_frame(frame, direction)
 
 
 class TranscriptProcessor:

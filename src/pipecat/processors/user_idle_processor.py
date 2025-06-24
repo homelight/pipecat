@@ -63,6 +63,8 @@ class UserIdleProcessor(FrameProcessor):
         **kwargs,
     ):
         super().__init__(**kwargs)
+        print("UserIdleProcessor __init__ called", self)
+        print("UserIdleProcessor after super().__init__", self)
         self._callback = self._wrap_callback(callback)
         self._timeout = timeout
         self._retry_count = 0
@@ -178,3 +180,6 @@ class UserIdleProcessor(FrameProcessor):
                         break
             finally:
                 self._idle_event.clear()
+
+    async def setup(self, *args, **kwargs):
+        await super().setup(*args, **kwargs)

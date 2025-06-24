@@ -50,6 +50,7 @@ class FrameProcessor(BaseObject):
         **kwargs,
     ):
         super().__init__(name=name)
+        print("FrameProcessor __init__ called", self)
         self._parent: Optional["FrameProcessor"] = None
         self._prev: Optional["FrameProcessor"] = None
         self._next: Optional["FrameProcessor"] = None
@@ -187,6 +188,7 @@ class FrameProcessor(BaseObject):
         await self._task_manager.wait_for_task(task, timeout)
 
     async def setup(self, setup: FrameProcessorSetup):
+        print(f"FrameProcessor.setup called for {self}")
         self._clock = setup.clock
         self._task_manager = setup.task_manager
         self._observer = setup.observer
