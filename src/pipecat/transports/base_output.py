@@ -22,6 +22,7 @@ from pipecat.frames.frames import (
     BotStoppedSpeakingFrame,
     CancelFrame,
     EndFrame,
+    ErrorFrame,
     Frame,
     MixerControlFrame,
     OutputAudioRawFrame,
@@ -388,9 +389,16 @@ class BaseOutputTransport(FrameProcessor):
                 self._audio_task = self._transport.create_task(self._audio_task_handler())
 
         async def _cancel_audio_task(self):
+            # Stop audio output task.
             if self._audio_task:
+                # Cancel the running audio task and wait until it finishes so that we
+                # are sure the BotStoppedSpeakingFrame (sent in the finally clause
+                # of the handler) has a chance to propagate before we continue.
                 await self._transport.cancel_task(self._audio_task)
                 self._audio_task = None
+            # Guarantee we always notify that the bot has stopped speaking even
+            # if the task never made it to the finally-block.
+            await self._bot_stopped_speaking()
 
         async def _bot_started_speaking(self):
             if not self._bot_speaking:
@@ -512,8 +520,11 @@ class BaseOutputTransport(FrameProcessor):
                         await self._transport.write_audio_frame(frame)
             except Exception as e:
                 logger.exception(f"{self._transport} audio task error: {e}")
-                await self._bot_stopped_speaking()
                 await self._transport.push_error(ErrorFrame(str(e)))
+            finally:
+                # The loop has ended either gracefully or through cancellation.
+                # Make absolutely sure we send the stop-speaking signal.
+                await self._bot_stopped_speaking()
 
         #
         # Video handling

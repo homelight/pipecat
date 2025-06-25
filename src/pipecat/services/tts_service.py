@@ -60,6 +60,10 @@ class TTSService(AIService):
         silence_time_s: float = 2.0,
         # if True, we will pause processing frames while we are receiving audio
         pause_frame_processing: bool = False,
+        # If the pipeline has been paused for longer than this, automatically
+        # resume it.  This is a safety-net in case a BotStoppedSpeakingFrame is
+        # lost.  Set to 0 (default) to disable.
+        auto_resume_timeout_s: float = 5.0,
         # TTS output sample rate
         sample_rate: Optional[int] = None,
         # Text aggregator to aggregate incoming tokens and decide when to push to the TTS.
@@ -79,6 +83,7 @@ class TTSService(AIService):
         self._push_silence_after_stop: bool = push_silence_after_stop
         self._silence_time_s: float = silence_time_s
         self._pause_frame_processing: bool = pause_frame_processing
+        self._auto_resume_timeout_s: float = auto_resume_timeout_s
         self._init_sample_rate = sample_rate
         self._sample_rate = 0
         self._voice_id: str = ""
@@ -102,6 +107,11 @@ class TTSService(AIService):
         self._stop_frame_queue: asyncio.Queue = asyncio.Queue()
 
         self._processing_text: bool = False
+
+        # When frame processing is paused we create a watchdog task that will
+        # resume it after a timeout in case the expected BotStoppedSpeakingFrame
+        # never arrives.
+        self._resume_watchdog_task: Optional[asyncio.Task] = None
 
     @property
     def sample_rate(self) -> int:
@@ -152,11 +162,19 @@ class TTSService(AIService):
             await self.cancel_task(self._stop_frame_task)
             self._stop_frame_task = None
 
+        if self._resume_watchdog_task and not self._resume_watchdog_task.done():
+            await self.cancel_task(self._resume_watchdog_task)
+            self._resume_watchdog_task = None
+
     async def cancel(self, frame: CancelFrame):
         await super().cancel(frame)
         if self._stop_frame_task:
             await self.cancel_task(self._stop_frame_task)
             self._stop_frame_task = None
+
+        if self._resume_watchdog_task and not self._resume_watchdog_task.done():
+            await self.cancel_task(self._resume_watchdog_task)
+            self._resume_watchdog_task = None
 
     async def _update_settings(self, settings: Mapping[str, Any]):
         for key, value in settings.items():
@@ -191,29 +209,39 @@ class TTSService(AIService):
             await self._handle_interruption(frame, direction)
             await self.push_frame(frame, direction)
         elif isinstance(frame, (LLMFullResponseEndFrame, EndFrame)):
-            # We pause processing incoming frames if the LLM response included
-            # text (it might be that it's only a function calling response). We
-            # pause to avoid audio overlapping.
-            await self._maybe_pause_frame_processing()
+            try:
+                # We pause processing incoming frames if the LLM response included
+                # text (it might be that it's only a function calling response). We
+                # pause to avoid audio overlapping.
+                await self._maybe_pause_frame_processing()
 
-            sentence = self._text_aggregator.text
-            await self._text_aggregator.reset()
-            self._processing_text = False
-            await self._push_tts_frames(sentence)
-            if isinstance(frame, LLMFullResponseEndFrame):
-                if self._push_text_frames:
+                sentence = self._text_aggregator.text
+                await self._text_aggregator.reset()
+                self._processing_text = False
+                await self._push_tts_frames(sentence)
+                if isinstance(frame, LLMFullResponseEndFrame):
+                    if self._push_text_frames:
+                        await self.push_frame(frame, direction)
+                else:
                     await self.push_frame(frame, direction)
-            else:
-                await self.push_frame(frame, direction)
+            except Exception as e:
+                logger.exception(f"{self}: error while handling LLM/End frame: {e}")
+                await self._maybe_resume_frame_processing()
+                await self.push_error(ErrorFrame(str(e)))
         elif isinstance(frame, TTSSpeakFrame):
-            # Store if we were processing text or not so we can set it back.
-            processing_text = self._processing_text
-            await self._push_tts_frames(frame.text)
-            # We pause processing incoming frames because we are sending data to
-            # the TTS. We pause to avoid audio overlapping.
-            await self._maybe_pause_frame_processing()
-            await self.flush_audio()
-            self._processing_text = processing_text
+            try:
+                # Store if we were processing text or not so we can set it back.
+                processing_text = self._processing_text
+                await self._push_tts_frames(frame.text)
+                # We pause processing incoming frames because we are sending data to
+                # the TTS. We pause to avoid audio overlapping.
+                await self._maybe_pause_frame_processing()
+                await self.flush_audio()
+                self._processing_text = processing_text
+            except Exception as e:
+                logger.exception(f"{self}: error while handling TTSSpeakFrame: {e}")
+                await self._maybe_resume_frame_processing()
+                await self.push_error(ErrorFrame(str(e)))
         elif isinstance(frame, TTSUpdateSettingsFrame):
             await self._update_settings(frame.settings)
         elif isinstance(frame, BotStoppedSpeakingFrame):
@@ -258,9 +286,30 @@ class TTSService(AIService):
         if self._processing_text and self._pause_frame_processing:
             await self.pause_processing_frames()
 
+            # Start (or restart) the watchdog timer that will force a resume.
+            if self._auto_resume_timeout_s > 0:
+                if self._resume_watchdog_task and not self._resume_watchdog_task.done():
+                    await self.cancel_task(self._resume_watchdog_task)
+                self._resume_watchdog_task = self.create_task(self._resume_watchdog())
+
     async def _maybe_resume_frame_processing(self):
         if self._pause_frame_processing:
             await self.resume_processing_frames()
+
+            # Cancel the watchdog if it is running.
+            if self._resume_watchdog_task and not self._resume_watchdog_task.done():
+                await self.cancel_task(self._resume_watchdog_task)
+                self._resume_watchdog_task = None
+
+    async def _resume_watchdog(self):
+        try:
+            await asyncio.sleep(self._auto_resume_timeout_s)
+            # If we reach this point it means the normal resume did not happen.
+            logger.info(f"{self}: auto-resuming BotStoppedSpeakingFrame frame processing after timeout")
+            await self._maybe_resume_frame_processing()
+        except asyncio.CancelledError:
+            # Task cancelled because resume happened normally.
+            pass
 
     async def _process_text_frame(self, frame: TextFrame):
         text: Optional[str] = None

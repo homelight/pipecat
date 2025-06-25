@@ -97,6 +97,9 @@ class FrameProcessor(BaseObject):
         # exception to this rule. This create this task.
         self.__push_frame_task: Optional[asyncio.Task] = None
 
+        # Ensure that only one interruption restart can happen at a time.
+        self.__interruption_lock: asyncio.Lock = asyncio.Lock()
+
     @property
     def id(self) -> int:
         return self._id
@@ -292,25 +295,26 @@ class FrameProcessor(BaseObject):
     #
 
     async def _start_interruption(self):
-        if self._cancelling:
-            logger.warning(f"{self}: skipping interruption restart while cancelling")
-            return
-        try:
-            # Cancel the push frame task. This will stop pushing frames downstream.
-            await self.__cancel_push_task()
+        async with self.__interruption_lock:
+            if self._cancelling:
+                logger.warning(f"{self}: skipping interruption restart while cancelling")
+                return
+            try:
+                # Cancel the push frame task. This will stop pushing frames downstream.
+                await self.__cancel_push_task()
 
-            # Cancel the input task. This will stop processing queued frames.
-            await self.__cancel_input_task()
-        except Exception as e:
-            logger.exception(f"Uncaught exception in {self}: {e}")
-            await self.push_error(ErrorFrame(str(e)))
-            raise
+                # Cancel the input task. This will stop processing queued frames.
+                await self.__cancel_input_task()
+            except Exception as e:
+                logger.exception(f"Uncaught exception in {self}: {e}")
+                await self.push_error(ErrorFrame(str(e)))
+                raise
 
-        # Create a new input queue and task.
-        self.__create_input_task()
+            # Create a new input queue and task.
+            self.__create_input_task()
 
-        # Create a new output queue and task.
-        self.__create_push_task()
+            # Create a new output queue and task.
+            self.__create_push_task()
 
     async def _stop_interruption(self):
         # Nothing to do right now.
