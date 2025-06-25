@@ -23,6 +23,7 @@ from pipecat.services.stt_service import STTService
 from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_stt
+import asyncio
 
 try:
     from deepgram import (
@@ -244,3 +245,16 @@ class DeepgramSTTService(STTService):
             # https://developers.deepgram.com/docs/finalize
             await self._connection.finalize()
             logger.trace(f"Triggered finalize event on: {frame.name=}, {direction=}")
+
+            async def finalize_with_timeout():
+                try:
+                    await asyncio.wait_for(self._connection.finalize(), timeout=3)
+                except asyncio.TimeoutError:
+                    logger.warning(f"{self} finalize() timed out")
+                except Exception as e:
+                    logger.warning(f"{self} finalize() error: {e}")
+
+            self.create_task(finalize_with_timeout())
+            logger.trace(
+                f"Triggered finalize event on: {frame.name=}, {direction=}"
+            )

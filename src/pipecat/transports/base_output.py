@@ -340,6 +340,9 @@ class BaseOutputTransport(FrameProcessor):
             if not self._params.audio_out_enabled:
                 return
 
+            if not self._audio_task:
+                self._create_audio_task()
+
             # We might need to resample if incoming audio doesn't match the
             # transport sample rate.
             resampled = await self._resampler.resample(
