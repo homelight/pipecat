@@ -352,6 +352,12 @@ class PipelineTask(BaseTask):
         """Stops the running pipeline immediately."""
         await self._cancel()
 
+    async def force_cancel(self):
+        """Forcefully cancel the task and any running subtasks."""
+        await self.cancel()
+        for task in self._task_manager.current_tasks():
+            await self._task_manager.cancel_task(task)
+            
     async def run(self):
         """Starts and manages the pipeline execution until completion or cancellation."""
         if self.has_finished():
