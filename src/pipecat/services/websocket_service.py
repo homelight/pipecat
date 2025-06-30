@@ -72,10 +72,6 @@ class WebsocketService(ABC):
                         self._websocket.close_sent,
                         self._websocket.close_rcvd_then_sent,
                     )
-            except asyncio.CancelledError:
-                logger.debug(f"{self} receive task cancelled")
-                break
-            
             except Exception as e:
                 message = f"{self} error receiving messages: {e}"
                 logger.error(message)

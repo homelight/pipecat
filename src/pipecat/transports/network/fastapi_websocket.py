@@ -11,7 +11,6 @@ import time
 import typing
 import wave
 from typing import Awaitable, Callable, Optional
-import re
 
 from loguru import logger
 from pydantic import BaseModel
@@ -298,14 +297,6 @@ class FastAPIWebsocketOutputTransport(BaseOutputTransport):
             if payload:
                 await self._client.send(payload)
         except Exception as e:
-            msg = str(e).lower()
-            if "cannot call" in msg and "once a close message has been sent" in msg:
-                logger.info(f"{self} detected closed websocket, shutting down pipeline")
-                # await self.cancel(CancelFrame())
-                await self._client.disconnect()
-                await self.cleanup()
-                return
-            # Otherwise, log as before
             logger.error(f"{self} exception sending data: {e.__class__.__name__} ({e})")
 
     async def _write_audio_sleep(self):
