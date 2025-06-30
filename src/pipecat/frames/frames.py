@@ -7,6 +7,7 @@
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import (
+    TYPE_CHECKING,
     Any,
     Awaitable,
     Callable,
@@ -25,6 +26,9 @@ from pipecat.metrics.metrics import MetricsData
 from pipecat.transcriptions.language import Language
 from pipecat.utils.time import nanoseconds_to_str
 from pipecat.utils.utils import obj_count, obj_id
+
+if TYPE_CHECKING:
+    from pipecat.processors.frame_processor import FrameProcessor
 
 
 class KeypadEntry(str, Enum):
@@ -449,8 +453,8 @@ class StartFrame(SystemFrame):
     allow_interruptions: bool = False
     enable_metrics: bool = False
     enable_usage_metrics: bool = False
-    report_only_initial_ttfb: bool = False
     interruption_strategies: List[BaseInterruptionStrategy] = field(default_factory=list)
+    report_only_initial_ttfb: bool = False
 
 
 @dataclass
@@ -486,16 +490,6 @@ class FatalErrorFrame(ErrorFrame):
 
 
 @dataclass
-class HeartbeatFrame(SystemFrame):
-    """This frame is used by the pipeline task as a mechanism to know if the
-    pipeline is running properly.
-
-    """
-
-    timestamp: int
-
-
-@dataclass
 class EndTaskFrame(SystemFrame):
     """This is used to notify the pipeline task that the pipeline should be
     closed nicely (flushing all the queued frames) by pushing an EndFrame
@@ -525,6 +519,29 @@ class StopTaskFrame(SystemFrame):
     """
 
     pass
+
+
+@dataclass
+class FrameProcessorPauseUrgentFrame(SystemFrame):
+    """This frame is used to pause frame processing for the given processor as
+    fast as possible. Pausing frame processing will keep frames in the internal
+    queue which will then be processed when frame processing is resumed with
+    `FrameProcessorResumeFrame`.
+
+    """
+
+    processor: "FrameProcessor"
+
+
+@dataclass
+class FrameProcessorResumeUrgentFrame(SystemFrame):
+    """This frame is used to resume frame processing for the given processor
+    if it was previously paused as fast as possible. After resuming frame
+    processing all queued frames will be processed in the order received.
+
+    """
+
+    processor: "FrameProcessor"
 
 
 @dataclass
@@ -852,6 +869,39 @@ class StopFrame(ControlFrame):
     """
 
     pass
+
+
+@dataclass
+class HeartbeatFrame(ControlFrame):
+    """This frame is used by the pipeline task as a mechanism to know if the
+    pipeline is running properly.
+
+    """
+
+    timestamp: int
+
+
+@dataclass
+class FrameProcessorPauseFrame(ControlFrame):
+    """This frame is used to pause frame processing for the given
+    processor. Pausing frame processing will keep frames in the internal queue
+    which will then be processed when frame processing is resumed with
+    `FrameProcessorResumeFrame`.
+
+    """
+
+    processor: "FrameProcessor"
+
+
+@dataclass
+class FrameProcessorResumeFrame(ControlFrame):
+    """This frame is used to resume frame processing for the given processor if
+    it was previously paused. After resuming frame processing all queued frames
+    will be processed in the order received.
+
+    """
+
+    processor: "FrameProcessor"
 
 
 @dataclass
