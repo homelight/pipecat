@@ -223,8 +223,6 @@ class RimeTTSService(AudioContextWordTTSService):
     async def _handle_interruption(self, frame: StartInterruptionFrame, direction: FrameDirection):
         """Handle interruption by clearing current context."""
         await super()._handle_interruption(frame, direction)
-        if self._cancelling:
-            return
         await self.stop_all_metrics()
         if self._context_id:
             await self._get_websocket().send(json.dumps(self._build_clear_msg()))

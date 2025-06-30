@@ -375,8 +375,6 @@ class ElevenLabsTTSService(AudioContextWordTTSService):
 
     async def _handle_interruption(self, frame: StartInterruptionFrame, direction: FrameDirection):
         await super()._handle_interruption(frame, direction)
-        if self._cancelling:
-            return
 
         # Close the current context when interrupted without closing the websocket
         if self._context_id and self._websocket:
