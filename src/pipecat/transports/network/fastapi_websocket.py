@@ -87,7 +87,7 @@ class FastAPIWebsocketClient:
                 logger.warning("Closing already disconnected websocket!")
                 self._closing = True
                 await self.trigger_client_disconnected()
-
+                
     async def disconnect(self):
         self._leave_counter -= 1
         if self._leave_counter > 0:
@@ -311,7 +311,16 @@ class FastAPIWebsocketOutputTransport(BaseOutputTransport):
             if payload:
                 await self._client.send(payload)
         except Exception as e:
+            # NOTE: HL OVERRIDE, detect closed websocket and shut down pipeline
+            msg = str(e).lower()
+            if "cannot call" in msg and "once a close message has been sent" in msg:
+                logger.info(f"{self} detected closed websocket, shutting down pipeline")
+                await self._client.disconnect()
+                await self.cleanup()
+                return
+            # Otherwise, log as before
             logger.error(f"{self} exception sending data: {e.__class__.__name__} ({e})")
+            
 
     async def _write_audio_sleep(self):
         # Simulate a clock.

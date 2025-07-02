@@ -123,11 +123,60 @@ class CartesiaSTTService(STTService):
         await self._disconnect()
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame, None]:
-        # If the connection is closed, due to timeout, we need to reconnect when the user starts speaking again
-        if not self._connection or self._connection.closed:
-            await self._connect()
+        """Send an audio chunk for transcription, maintaining a resilient connection.
 
-        await self._connection.send(audio)
+        The Cartesia WebSocket can be closed by the remote side at any time. In that
+        scenario, ``websockets`` raises a ``ConnectionClosed`` (or
+        ``ConnectionClosedOK``) exception on ``send``.  Propagating that
+        exception up the stack aborts the whole Pipecat pipeline, resulting in
+        noisy logs like:
+
+            websockets.exceptions.ConnectionClosedOK: sent 1000 (OK); then received 1000 (OK)
+
+        Instead, we catch the closure here, perform a best-effort reconnect, and
+        silently drop the current audio buffer.  The next audio buffer will be
+        delivered over the fresh connection.
+        """
+
+        try:
+            # If the processor is cancelling/end-of-pipeline we skip sending
+            # altogether because the connection is expected to be closed.
+            if self._cancelling:
+                # Consume the audio frame silently and exit early.
+                yield None
+                return
+
+            # (Re)connect only when we are still active.
+            if not self._connection or self._connection.closed:
+                await self._connect()
+
+            # Attempt to send the audio payload
+            await self._connection.send(audio)
+        except (
+            websockets.exceptions.ConnectionClosedOK,
+            websockets.exceptions.ConnectionClosedError,
+            websockets.exceptions.ConnectionClosed,
+        ) as e:
+            # Connection closed gracefully or with an error – attempt to
+            # reconnect so we can continue processing without failing the
+            # entire pipeline.
+            logger.warning(f"{self}: WebSocket closed during send: {e}. Reconnecting.")
+            try:
+                await self._disconnect()
+            except Exception:
+                # Ignore additional errors while cleaning up
+                pass
+
+            await self._connect()
+            # We purposefully *do not* resend the audio buffer: by the time the
+            # reconnection succeeds the buffer would be outdated and resending
+            # could confuse the transcription stream.
+        except Exception as e:
+            # Catch-all to prevent the exception from bubbling up and killing
+            # the pipeline.  We log the error and try to keep going.
+            logger.error(f"{self}: Unexpected error while sending audio: {e}")
+
+        # Always yield once so the caller can keep iterating over the generator
         yield None
 
     async def _connect(self):
