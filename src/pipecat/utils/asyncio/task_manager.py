@@ -240,6 +240,12 @@ class TaskManager(BaseTaskManager):
 
         """
         name = task.get_name()
+        
+        # Avoid awaiting on ourselves which would lead to a recursion error.
+        if task is asyncio.current_task():
+            task.cancel()
+            return
+        
         task.cancel()
         try:
             # Make sure to reset watchdog if a task is cancelled.
