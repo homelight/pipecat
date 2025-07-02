@@ -8,6 +8,7 @@
 
 from typing import AsyncGenerator, Dict, Optional
 import asyncio
+import contextlib
 
 from loguru import logger
 
@@ -229,17 +230,35 @@ class DeepgramSTTService(STTService):
             logger.error(f"{self}: unable to connect to Deepgram")
 
     async def _disconnect(self):
-        if self._connection.is_connected:
-            logger.debug("Disconnecting from Deepgram")
+        """Initiate a graceful disconnect but never block on Deepgram SDK internals.
+
+        The Deepgram SDK occasionally hangs in `finish()` when the TCP socket has
+        already been torn down by the far-end.  To ensure pipeline shutdown can
+        always proceed we fire-and-forget the `finish()` coroutine and return
+        control immediately.
+        """
+        if not self._connection.is_connected:
+            return
+
+        logger.debug("Disconnecting from Deepgram – v3 (non-blocking)")
+
+        async def _finish_safe():
             try:
-                await asyncio.wait_for(self._connection.finish(), timeout=2)
-            except asyncio.TimeoutError:
-                logger.warning("Deepgram finish() timed out – closing socket forcefully")
-                try:
+                await asyncio.wait_for(self._connection.finish(), timeout=4)
+                logger.debug("Deepgram finish() completed")
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                logger.warning("Deepgram finish() did not complete in 4s – closing socket")
+                with contextlib.suppress(Exception):
                     await self._connection.close()
-                except Exception as e:
-                    logger.warning(f"Error closing Deepgram socket: {e}")
-            logger.debug("Deepgram socket closed")
+            except Exception as e:
+                logger.warning(f"Deepgram finish() raised {e} – closing socket")
+                with contextlib.suppress(Exception):
+                    await self._connection.close()
+            finally:
+                logger.debug("Deepgram disconnect task done")
+
+        # Run in background – shutdown must not wait for this.
+        asyncio.create_task(_finish_safe())
 
     async def start_metrics(self):
         """Start TTFB and processing metrics collection."""
