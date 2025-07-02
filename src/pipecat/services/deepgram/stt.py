@@ -7,6 +7,7 @@
 """Deepgram speech-to-text service implementation."""
 
 from typing import AsyncGenerator, Dict, Optional
+import asyncio
 
 from loguru import logger
 
@@ -230,7 +231,15 @@ class DeepgramSTTService(STTService):
     async def _disconnect(self):
         if self._connection.is_connected:
             logger.debug("Disconnecting from Deepgram")
-            await self._connection.finish()
+            try:
+                await asyncio.wait_for(self._connection.finish(), timeout=2)
+            except asyncio.TimeoutError:
+                logger.warning("Deepgram finish() timed out – closing socket forcefully")
+                try:
+                    await self._connection.close()
+                except Exception as e:
+                    logger.warning(f"Error closing Deepgram socket: {e}")
+            logger.debug("Deepgram socket closed")
 
     async def start_metrics(self):
         """Start TTFB and processing metrics collection."""
