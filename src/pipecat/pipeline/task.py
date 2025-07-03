@@ -385,6 +385,7 @@ class PipelineTask(BasePipelineTask):
 
     async def force_cancel(self):
         """Forcefully cancel the task and any running subtasks."""
+        logger.debug(f"Force canceling task {self} triggered")
         try:
             await self.cancel()
         except Exception as e:
