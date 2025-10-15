@@ -120,25 +120,33 @@ class FastAPIWebsocketClient:
         Args:
             data: The data to send (string or bytes).
         """
-        try:
-            if self._can_send():
-                if self._is_binary:
-                    await self._websocket.send_bytes(data)
-                else:
-                    await self._websocket.send_text(data)
-        except Exception as e:
-            logger.error(
-                f"{self} exception sending data: {e.__class__.__name__} ({e}), application_state: {self._websocket.application_state}"
-            )
-            # For some reason the websocket is disconnected, and we are not able to send data
-            # So let's properly handle it and disconnect the transport if it is not already disconnecting
-            if (
-                self._websocket.application_state == WebSocketState.DISCONNECTED
-                and not self.is_closing
-            ):
-                logger.warning("Closing already disconnected websocket!")
-                self._closing = True
-                await self.trigger_client_disconnected()
+        if self._can_send():
+            if self._is_binary:
+                await self._websocket.send_bytes(data)
+            else:
+                await self._websocket.send_text(data)
+
+        # NOTE: HL OVERRIDE, this Fix below from pipecat 
+        # https://github.com/pipecat-ai/pipecat/commit/74280829fcf5e03754ba5263162ff70eaabcdc4a
+        # can catch the error but causes occasional stalling
+        # fall back using the HL Override below in FastAPIWebsocketOutputTransport
+
+        # try:
+        #     if self._can_send():
+        #         if self._is_binary:
+        #             await self._websocket.send_bytes(data)
+        #         else:
+        #             await self._websocket.send_text(data)
+        # except Exception as e:
+        #     logger.error(
+        #         f"{self} exception sending data: {e.__class__.__name__} ({e}), application_state: {self._websocket.application_state}"
+        #     )
+        #     # For some reason the websocket is disconnected, and we are not able to send data
+        #     # So let's properly handle it and disconnect the transport
+        #     if self._websocket.application_state == WebSocketState.DISCONNECTED:
+        #         logger.warning("Closing already disconnected websocket!")
+        #         self._closing = True
+        #         await self.trigger_client_disconnected()
 
     async def disconnect(self):
         """Disconnect the WebSocket client."""
@@ -448,13 +456,18 @@ class FastAPIWebsocketOutputTransport(BaseOutputTransport):
         """Serialize and send a frame through the WebSocket."""
         if not self._params.serializer:
             return
-
         try:
             payload = await self._params.serializer.serialize(frame)
             if payload:
                 await self._client.send(payload)
         except Exception as e:
-            logger.error(f"{self} exception sending data: {e.__class__.__name__} ({e})")
+            # NOTE: HL OVERRIDE, detect closed websocket and shut down pipeline
+            msg = str(e).lower()
+            if (
+                ("cannot call" in msg and "once a close message has been sent" in msg) or
+                self._client._websocket.application_state == WebSocketState.DISCONNECTED
+            ):
+                logger.warning(f"{self} detected closed websocket, shutting down pipeline")
 
     async def _write_audio_sleep(self):
         """Simulate audio playback timing with appropriate delays."""
