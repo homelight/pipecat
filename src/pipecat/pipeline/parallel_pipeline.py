@@ -4,227 +4,171 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-import asyncio
+"""Parallel pipeline implementation for concurrent frame processing.
+
+This module provides a parallel pipeline that processes frames through multiple
+sub-pipelines concurrently, with coordination for system frames and proper
+handling of pipeline lifecycle events.
+"""
+
 from itertools import chain
-from typing import Awaitable, Callable, Dict, List
+from typing import Dict, List
 
 from loguru import logger
 
-from pipecat.frames.frames import (
-    CancelFrame,
-    EndFrame,
-    Frame,
-    StartFrame,
-    StartInterruptionFrame,
-    SystemFrame,
-)
+from pipecat.frames.frames import CancelFrame, EndFrame, Frame, StartFrame
 from pipecat.pipeline.base_pipeline import BasePipeline
-from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.pipeline import Pipeline, PipelineSink, PipelineSource
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
-from pipecat.utils.asyncio.watchdog_queue import WatchdogQueue
-
-
-class ParallelPipelineSource(FrameProcessor):
-    def __init__(
-        self,
-        upstream_queue: asyncio.Queue,
-        push_frame_func: Callable[[Frame, FrameDirection], Awaitable[None]],
-    ):
-        super().__init__()
-        self._up_queue = upstream_queue
-        self._push_frame_func = push_frame_func
-
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
-
-        match direction:
-            case FrameDirection.UPSTREAM:
-                if isinstance(frame, SystemFrame):
-                    await self._push_frame_func(frame, direction)
-                else:
-                    await self._up_queue.put(frame)
-            case FrameDirection.DOWNSTREAM:
-                await self.push_frame(frame, direction)
-
-
-class ParallelPipelineSink(FrameProcessor):
-    def __init__(
-        self,
-        downstream_queue: asyncio.Queue,
-        push_frame_func: Callable[[Frame, FrameDirection], Awaitable[None]],
-    ):
-        super().__init__()
-        self._down_queue = downstream_queue
-        self._push_frame_func = push_frame_func
-
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
-
-        match direction:
-            case FrameDirection.UPSTREAM:
-                await self.push_frame(frame, direction)
-            case FrameDirection.DOWNSTREAM:
-                if isinstance(frame, SystemFrame):
-                    await self._push_frame_func(frame, direction)
-                else:
-                    await self._down_queue.put(frame)
 
 
 class ParallelPipeline(BasePipeline):
+    """Pipeline that processes frames through multiple sub-pipelines concurrently.
+
+    Creates multiple parallel processing branches from the provided processor lists,
+    coordinating frame flow and ensuring proper synchronization of lifecycle events
+    like EndFrames. Each branch runs independently while system frames are handled
+    specially to maintain pipeline coordination.
+    """
+
     def __init__(self, *args):
+        """Initialize the parallel pipeline with processor lists.
+
+        Args:
+            *args: Variable number of processor lists, each becoming a parallel branch.
+
+        Raises:
+            Exception: If no processor lists are provided.
+            TypeError: If any argument is not a list of processors.
+        """
+        # We don't set it to direct mode because we use frame pausing and that
+        # requires queues.
         super().__init__()
 
         if len(args) == 0:
             raise Exception(f"ParallelPipeline needs at least one argument")
 
-        self._args = args
-        self._sources = []
-        self._sinks = []
         self._pipelines = []
 
         self._seen_ids = set()
-        self._endframe_counter: Dict[int, int] = {}
+        self._frame_counter: Dict[int, int] = {}
 
-        self._up_task = None
-        self._down_task = None
+        logger.debug(f"Creating {self} pipelines")
 
-    #
-    # BasePipeline
-    #
+        for processors in args:
+            if not isinstance(processors, list):
+                raise TypeError(f"ParallelPipeline argument {processors} is not a list")
 
-    def processors_with_metrics(self) -> List[FrameProcessor]:
-        return list(chain.from_iterable(p.processors_with_metrics() for p in self._pipelines))
+            num_pipelines = len(self._pipelines)
+
+            # We add a source before the pipeline and a sink after so we control
+            # the frames that are pushed upstream and downstream.
+            source = PipelineSource(
+                self._parallel_push_frame, name=f"{self}::Source{num_pipelines}"
+            )
+            sink = PipelineSink(self._pipeline_sink_push_frame, name=f"{self}::Sink{num_pipelines}")
+
+            # Create pipeline
+            pipeline = Pipeline(processors, source=source, sink=sink)
+            self._pipelines.append(pipeline)
+
+        logger.debug(f"Finished creating {self} pipelines")
 
     #
     # Frame processor
     #
 
+    @property
+    def processors(self):
+        """Return the list of sub-processors contained within this processor.
+
+        Only compound processors (e.g. pipelines and parallel pipelines) have
+        sub-processors. Non-compound processors will return an empty list.
+
+        Returns:
+            The list of sub-processors if this is a compound processor.
+        """
+        return self._pipelines
+
+    @property
+    def entry_processors(self) -> List["FrameProcessor"]:
+        """Return the list of entry processors for this processor.
+
+        Entry processors are the first processors in a compound processor
+        (e.g. pipelines, parallel pipelines). Note that pipelines can also be an
+        entry processor as pipelines are processors themselves. Non-compound
+        processors will simply return an empty list.
+
+        Returns:
+            The list of entry processors.
+        """
+        return self._pipelines
+
+    def processors_with_metrics(self) -> List[FrameProcessor]:
+        """Collect processors that can generate metrics from all parallel branches.
+
+        Returns:
+            List of frame processors that support metrics collection from all branches.
+        """
+        return list(chain.from_iterable(p.processors_with_metrics() for p in self._pipelines))
+
     async def setup(self, setup: FrameProcessorSetup):
+        """Set up the parallel pipeline and all its branches.
+
+        Args:
+            setup: Configuration for frame processor setup.
+
+        Raises:
+            TypeError: If any processor list argument is not actually a list.
+        """
         await super().setup(setup)
-
-        self._up_queue = WatchdogQueue(setup.task_manager)
-        self._down_queue = WatchdogQueue(setup.task_manager)
-
-        logger.debug(f"Creating {self} pipelines")
-        for processors in self._args:
-            if not isinstance(processors, list):
-                raise TypeError(f"ParallelPipeline argument {processors} is not a list")
-
-            # We will add a source before the pipeline and a sink after.
-            source = ParallelPipelineSource(self._up_queue, self._parallel_push_frame)
-            sink = ParallelPipelineSink(self._down_queue, self._parallel_push_frame)
-            self._sources.append(source)
-            self._sinks.append(sink)
-
-            # Create pipeline
-            pipeline = Pipeline(processors)
-            source.link(pipeline)
-            pipeline.link(sink)
-            self._pipelines.append(pipeline)
-
-        logger.debug(f"Finished creating {self} pipelines")
-
-        await asyncio.gather(*[s.setup(setup) for s in self._sources])
-        await asyncio.gather(*[p.setup(setup) for p in self._pipelines])
-        await asyncio.gather(*[s.setup(setup) for s in self._sinks])
+        for p in self._pipelines:
+            await p.setup(setup)
 
     async def cleanup(self):
+        """Clean up the parallel pipeline and all its branches."""
         await super().cleanup()
-        await asyncio.gather(*[s.cleanup() for s in self._sources])
-        await asyncio.gather(*[p.cleanup() for p in self._pipelines])
-        await asyncio.gather(*[s.cleanup() for s in self._sinks])
+        for p in self._pipelines:
+            await p.cleanup()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
+        """Process frames through all parallel branches with lifecycle coordination.
+
+        Args:
+            frame: The frame to process.
+            direction: The direction of frame flow.
+        """
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, StartFrame):
-            await self._start(frame)
-        elif isinstance(frame, EndFrame):
-            self._endframe_counter[frame.id] = len(self._pipelines)
-        elif isinstance(frame, CancelFrame):
-            await self._cancel()
+        # Parallel pipeline synchronized frames.
+        if isinstance(frame, (StartFrame, EndFrame, CancelFrame)):
+            self._frame_counter[frame.id] = len(self._pipelines)
+            await self.pause_processing_system_frames()
+            await self.pause_processing_frames()
 
-        if direction == FrameDirection.UPSTREAM:
-            # If we get an upstream frame we process it in each sink.
-            await asyncio.gather(*[s.queue_frame(frame, direction) for s in self._sinks])
-        elif direction == FrameDirection.DOWNSTREAM:
-            # If we get a downstream frame we process it in each source.
-            await asyncio.gather(*[s.queue_frame(frame, direction) for s in self._sources])
-
-        # Handle interruptions after everything has been cancelled.
-        if isinstance(frame, StartInterruptionFrame):
-            await self._handle_interruption()
-        # Wait for tasks to finish.
-        elif isinstance(frame, EndFrame):
-            await self._stop()
-
-    async def _start(self, frame: StartFrame):
-        await self._create_tasks()
-
-    async def _stop(self):
-        if self._up_task:
-            # The up task doesn't receive an EndFrame, so we just cancel it.
-            await self.cancel_task(self._up_task)
-            self._up_task = None
-
-        if self._down_task:
-            # The down tasks waits for the last EndFrame sent by the internal
-            # pipelines.
-            await self._down_task
-            self._down_task = None
-
-    async def _cancel(self):
-        if self._up_task:
-            await self.cancel_task(self._up_task)
-            self._up_task = None
-        if self._down_task:
-            await self.cancel_task(self._down_task)
-            self._down_task = None
-
-    async def _create_tasks(self):
-        if not self._up_task:
-            self._up_task = self.create_task(self._process_up_queue())
-        if not self._down_task:
-            self._down_task = self.create_task(self._process_down_queue())
-
-    async def _drain_queues(self):
-        while not self._up_queue.empty:
-            await self._up_queue.get()
-        while not self._down_queue.empty:
-            await self._down_queue.get()
-
-    async def _handle_interruption(self):
-        await self._cancel()
-        await self._drain_queues()
-        await self._create_tasks()
+        # Process frames in each of the sub-pipelines.
+        for p in self._pipelines:
+            await p.queue_frame(frame, direction)
 
     async def _parallel_push_frame(self, frame: Frame, direction: FrameDirection):
+        """Push frames while avoiding duplicates using frame ID tracking."""
         if frame.id not in self._seen_ids:
             self._seen_ids.add(frame.id)
             await self.push_frame(frame, direction)
 
-    async def _process_up_queue(self):
-        while True:
-            frame = await self._up_queue.get()
-            await self._parallel_push_frame(frame, FrameDirection.UPSTREAM)
-            self._up_queue.task_done()
+    async def _pipeline_sink_push_frame(self, frame: Frame, direction: FrameDirection):
+        # Parallel pipeline synchronized frames.
+        if isinstance(frame, (StartFrame, EndFrame, CancelFrame)):
+            # Decrement counter.
+            frame_counter = self._frame_counter.get(frame.id, 0)
+            if frame_counter > 0:
+                self._frame_counter[frame.id] -= 1
+                frame_counter = self._frame_counter[frame.id]
 
-    async def _process_down_queue(self):
-        running = True
-        while running:
-            frame = await self._down_queue.get()
-
-            endframe_counter = self._endframe_counter.get(frame.id, 0)
-
-            # If we have a counter, decrement it.
-            if endframe_counter > 0:
-                self._endframe_counter[frame.id] -= 1
-                endframe_counter = self._endframe_counter[frame.id]
-
-            # If we don't have a counter or we reached 0, push the frame.
-            if endframe_counter == 0:
-                await self._parallel_push_frame(frame, FrameDirection.DOWNSTREAM)
-
-            running = not (endframe_counter == 0 and isinstance(frame, EndFrame))
-
-            self._down_queue.task_done()
+            # Only push the frame when all pipelines have processed it.
+            if frame_counter == 0:
+                await self._parallel_push_frame(frame, direction)
+                await self.resume_processing_system_frames()
+                await self.resume_processing_frames()
+        else:
+            await self._parallel_push_frame(frame, direction)

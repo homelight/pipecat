@@ -13,6 +13,7 @@ from loguru import logger
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from pipecat.services.llm_service import FunctionCallParams
 from pipecat.utils.base_object import BaseObject
 
 try:
@@ -53,6 +54,7 @@ class MCPClient(BaseObject):
         super().__init__(**kwargs)
         self._server_params = server_params
         self._session = ClientSession
+        self._needs_alternate_schema = False
 
         if isinstance(server_params, StdioServerParameters):
             self._client = stdio_client
@@ -80,8 +82,47 @@ class MCPClient(BaseObject):
         Returns:
             A ToolsSchema containing all successfully registered tools.
         """
+        # Check once if the LLM needs alternate strict schema
+        self._needs_alternate_schema = llm and llm.needs_mcp_alternate_schema()
         tools_schema = await self._register_tools(llm)
         return tools_schema
+
+    def _get_alternate_schema_for_strict_validation(self, schema: Dict[str, Any]) -> Dict[str, Any]:
+        """Get an alternate JSON schema to be compatible with LLMs that have strict validation.
+
+        Some LLMs have stricter validation and don't allow certain schema properties
+        that are valid in standard JSON Schema.
+
+        Args:
+            schema: The JSON schema to get an alternate schema for
+
+        Returns:
+            An alternate schema compatible with strict validation
+        """
+        if not isinstance(schema, dict):
+            return schema
+
+        alternate_schema = {}
+
+        for key, value in schema.items():
+            # Skip additionalProperties as some LLMs don't like additionalProperties: false
+            if key == "additionalProperties":
+                continue
+
+            # Recursively get alternate schema for nested objects
+            if isinstance(value, dict):
+                alternate_schema[key] = self._get_alternate_schema_for_strict_validation(value)
+            elif isinstance(value, list):
+                alternate_schema[key] = [
+                    self._get_alternate_schema_for_strict_validation(item)
+                    if isinstance(item, dict)
+                    else item
+                    for item in value
+                ]
+            else:
+                alternate_schema[key] = value
+
+        return alternate_schema
 
     def _convert_mcp_schema_to_pipecat(
         self, tool_name: str, tool_schema: Dict[str, Any]
@@ -99,6 +140,11 @@ class MCPClient(BaseObject):
 
         properties = tool_schema["input_schema"].get("properties", {})
         required = tool_schema["input_schema"].get("required", [])
+
+        # Only get alternate schema for LLMs that need strict schema validation
+        if self._needs_alternate_schema:
+            logger.debug("Getting alternate schema for strict validation")
+            properties = self._get_alternate_schema_for_strict_validation(properties)
 
         schema = FunctionSchema(
             name=tool_name,
@@ -120,27 +166,24 @@ class MCPClient(BaseObject):
             A ToolsSchema containing all registered tools
         """
 
-        async def mcp_tool_wrapper(
-            function_name: str,
-            tool_call_id: str,
-            arguments: Dict[str, Any],
-            llm: any,
-            context: any,
-            result_callback: any,
-        ) -> None:
+        async def mcp_tool_wrapper(params: FunctionCallParams) -> None:
             """Wrapper for mcp tool calls to match Pipecat's function call interface."""
-            logger.debug(f"Executing tool '{function_name}' with call ID: {tool_call_id}")
-            logger.trace(f"Tool arguments: {json.dumps(arguments, indent=2)}")
+            logger.debug(
+                f"Executing tool '{params.function_name}' with call ID: {params.tool_call_id}"
+            )
+            logger.trace(f"Tool arguments: {json.dumps(params.arguments, indent=2)}")
             try:
                 async with self._client(**self._server_params.model_dump()) as (read, write):
                     async with self._session(read, write) as session:
                         await session.initialize()
-                        await self._call_tool(session, function_name, arguments, result_callback)
+                        await self._call_tool(
+                            session, params.function_name, params.arguments, params.result_callback
+                        )
             except Exception as e:
-                error_msg = f"Error calling mcp tool {function_name}: {str(e)}"
+                error_msg = f"Error calling mcp tool {params.function_name}: {str(e)}"
                 logger.error(error_msg)
                 logger.exception("Full exception details:")
-                await result_callback(error_msg)
+                await params.result_callback(error_msg)
 
         logger.debug(f"SSE server parameters: {self._server_params}")
         logger.debug("Starting registration of mcp tools")
@@ -160,27 +203,24 @@ class MCPClient(BaseObject):
             A ToolsSchema containing all registered tools
         """
 
-        async def mcp_tool_wrapper(
-            function_name: str,
-            tool_call_id: str,
-            arguments: Dict[str, Any],
-            llm: any,
-            context: any,
-            result_callback: any,
-        ) -> None:
+        async def mcp_tool_wrapper(params: FunctionCallParams) -> None:
             """Wrapper for mcp tool calls to match Pipecat's function call interface."""
-            logger.debug(f"Executing tool '{function_name}' with call ID: {tool_call_id}")
-            logger.trace(f"Tool arguments: {json.dumps(arguments, indent=2)}")
+            logger.debug(
+                f"Executing tool '{params.function_name}' with call ID: {params.tool_call_id}"
+            )
+            logger.trace(f"Tool arguments: {json.dumps(params.arguments, indent=2)}")
             try:
                 async with self._client(self._server_params) as streams:
                     async with self._session(streams[0], streams[1]) as session:
                         await session.initialize()
-                        await self._call_tool(session, function_name, arguments, result_callback)
+                        await self._call_tool(
+                            session, params.function_name, params.arguments, params.result_callback
+                        )
             except Exception as e:
-                error_msg = f"Error calling mcp tool {function_name}: {str(e)}"
+                error_msg = f"Error calling mcp tool {params.function_name}: {str(e)}"
                 logger.error(error_msg)
                 logger.exception("Full exception details:")
-                await result_callback(error_msg)
+                await params.result_callback(error_msg)
 
         logger.debug("Starting registration of mcp tools")
 
@@ -199,17 +239,12 @@ class MCPClient(BaseObject):
             A ToolsSchema containing all registered tools
         """
 
-        async def mcp_tool_wrapper(
-            function_name: str,
-            tool_call_id: str,
-            arguments: Dict[str, Any],
-            llm: any,
-            context: any,
-            result_callback: any,
-        ) -> None:
+        async def mcp_tool_wrapper(params: FunctionCallParams) -> None:
             """Wrapper for mcp tool calls to match Pipecat's function call interface."""
-            logger.debug(f"Executing tool '{function_name}' with call ID: {tool_call_id}")
-            logger.trace(f"Tool arguments: {json.dumps(arguments, indent=2)}")
+            logger.debug(
+                f"Executing tool '{params.function_name}' with call ID: {params.tool_call_id}"
+            )
+            logger.trace(f"Tool arguments: {json.dumps(params.arguments, indent=2)}")
             try:
                 async with self._client(**self._server_params.model_dump()) as (
                     read_stream,
@@ -218,12 +253,14 @@ class MCPClient(BaseObject):
                 ):
                     async with self._session(read_stream, write_stream) as session:
                         await session.initialize()
-                        await self._call_tool(session, function_name, arguments, result_callback)
+                        await self._call_tool(
+                            session, params.function_name, params.arguments, params.result_callback
+                        )
             except Exception as e:
-                error_msg = f"Error calling mcp tool {function_name}: {str(e)}"
+                error_msg = f"Error calling mcp tool {params.function_name}: {str(e)}"
                 logger.error(error_msg)
                 logger.exception("Full exception details:")
-                await result_callback(error_msg)
+                await params.result_callback(error_msg)
 
         logger.debug("Starting registration of mcp tools using streamable HTTP")
 
@@ -280,7 +317,8 @@ class MCPClient(BaseObject):
             try:
                 # Convert the schema
                 function_schema = self._convert_mcp_schema_to_pipecat(
-                    tool_name, {"description": tool.description, "input_schema": tool.inputSchema}
+                    tool_name,
+                    {"description": tool.description, "input_schema": tool.inputSchema},
                 )
 
                 # Register the wrapped function

@@ -15,6 +15,9 @@ from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
     Frame,
+    FunctionCallInProgressFrame,
+    FunctionCallResultFrame,
+    StartFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
@@ -28,8 +31,8 @@ class UserIdleProcessor(FrameProcessor):
     users become idle. It starts monitoring only after the first conversation
     activity and supports both basic and retry-based callback patterns.
 
-    Example:
-        ```
+    Example::
+
         # Retry callback:
         async def handle_idle(processor: "UserIdleProcessor", retry_count: int) -> bool:
             if retry_count < 3:
@@ -45,7 +48,6 @@ class UserIdleProcessor(FrameProcessor):
             callback=handle_idle,
             timeout=5.0
         )
-        ```
     """
 
     def __init__(
@@ -61,11 +63,10 @@ class UserIdleProcessor(FrameProcessor):
         """Initialize the user idle processor.
 
         Args:
-            callback: Function to call when user is idle. Can be either:
-                - Basic callback(processor) -> None
-                - Retry callback(processor, retry_count) -> bool
-                  Return True to continue monitoring for idle events,
-                  Return False to stop the idle monitoring task
+            callback: Function to call when user is idle. Can be either a basic
+                callback taking only the processor, or a retry callback taking
+                the processor and retry count. Retry callbacks should return
+                True to continue monitoring or False to stop.
             timeout: Seconds to wait before considering user idle.
             **kwargs: Additional arguments passed to FrameProcessor.
         """
@@ -164,6 +165,13 @@ class UserIdleProcessor(FrameProcessor):
                 self._interrupted = False
                 self._idle_event.set()
             elif isinstance(frame, BotSpeakingFrame):
+                self._idle_event.set()
+            elif isinstance(frame, FunctionCallInProgressFrame):
+                # Function calls can take longer than the timeout, so we want to prevent idle callbacks
+                self._interrupted = True
+                self._idle_event.set()
+            elif isinstance(frame, FunctionCallResultFrame):
+                self._interrupted = False
                 self._idle_event.set()
 
     async def cleanup(self) -> None:

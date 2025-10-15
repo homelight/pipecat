@@ -4,44 +4,92 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-import re
-from typing import Optional, Sequence, Tuple
+"""Text processing utilities for sentence boundary detection and tag parsing.
 
-ENDOFSENTENCE_PATTERN_STR = r"""
-    (?<![A-Z])       # Negative lookbehind: not preceded by an uppercase letter (e.g., "U.S.A.")
-    (?<!\d\.\d)      # Not preceded by a decimal number (e.g., "3.14159")
-    (?<!^\d\.)       # Not preceded by a numbered list item (e.g., "1. Let's start")
-    (?<!\d\s[ap])    # Negative lookbehind: not preceded by time (e.g., "3:00 a.m.")
-    (?<!Mr|Ms|Dr)    # Negative lookbehind: not preceded by Mr, Ms, Dr (combined bc. length is the same)
-    (?<!Mrs)         # Negative lookbehind: not preceded by "Mrs"
-    (?<!Prof)        # Negative lookbehind: not preceded by "Prof"
-    (\.\s*\.\s*\.|[\.\?\!;])|   # Match a period, question mark, exclamation point, or semicolon
-    (\。\s*\。\s*\。|[。？！；।])  # the full-width version (mainly used in East Asian languages such as Chinese, Hindi)
-    $                # End of string
+This module provides utilities for natural language text processing including
+sentence boundary detection, email and number pattern handling, and XML-style
+tag parsing for structured text content.
+
+Dependencies:
+    This module uses NLTK (Natural Language Toolkit) for robust sentence
+    tokenization. NLTK is licensed under the Apache License 2.0.
+    See: https://www.nltk.org/
+    Source: https://www.nltk.org/api/nltk.tokenize.punkt.html
 """
 
-ENDOFSENTENCE_PATTERN = re.compile(ENDOFSENTENCE_PATTERN_STR, re.VERBOSE)
+import re
+from typing import FrozenSet, Optional, Sequence, Tuple
 
-EMAIL_PATTERN = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+import nltk
+from nltk.tokenize import sent_tokenize
 
-NUMBER_PATTERN = re.compile(r"[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?")
+# Ensure punkt_tab tokenizer data is available
+try:
+    nltk.data.find("tokenizers/punkt_tab")
+except LookupError:
+    nltk.download("punkt_tab", quiet=True)
+
+SENTENCE_ENDING_PUNCTUATION: FrozenSet[str] = frozenset(
+    {
+        # Latin script punctuation (most European languages, Filipino, etc.)
+        ".",
+        "!",
+        "?",
+        ";",
+        # East Asian punctuation (Chinese (Traditional & Simplified), Japanese, Korean)
+        "。",  # Ideographic full stop
+        "？",  # Full-width question mark
+        "！",  # Full-width exclamation mark
+        "；",  # Full-width semicolon
+        "．",  # Full-width period
+        "｡",  # Halfwidth ideographic period
+        # Indic scripts punctuation (Hindi, Sanskrit, Marathi, Nepali, Bengali, Tamil, Telugu, Kannada, Malayalam, Gujarati, Punjabi, Oriya, Assamese)
+        "।",  # Devanagari danda (single vertical bar)
+        "॥",  # Devanagari double danda (double vertical bar)
+        # Arabic script punctuation (Arabic, Persian, Urdu, Pashto)
+        "؟",  # Arabic question mark
+        "؛",  # Arabic semicolon
+        "۔",  # Urdu full stop
+        "؏",  # Arabic sign misra (classical texts)
+        # Thai
+        "।",  # Thai uses Devanagari-style punctuation in some contexts
+        # Myanmar/Burmese
+        "၊",  # Myanmar sign little section
+        "။",  # Myanmar sign section
+        # Khmer
+        "។",  # Khmer sign khan
+        "៕",  # Khmer sign bariyoosan
+        # Lao
+        "໌",  # Lao cancellation mark (used as period)
+        "༎",  # Tibetan mark delimiter tsheg bstar (also used in Lao contexts)
+        # Tibetan
+        "།",  # Tibetan mark intersyllabic tsheg
+        "༎",  # Tibetan mark delimiter tsheg bstar
+        # Armenian
+        "։",  # Armenian full stop
+        "՜",  # Armenian exclamation mark
+        "՞",  # Armenian question mark
+        # Ethiopic script (Amharic)
+        "።",  # Ethiopic full stop
+        "፧",  # Ethiopic question mark
+        "፨",  # Ethiopic paragraph separator
+    }
+)
 
 StartEndTags = Tuple[str, str]
 
 
 def replace_match(text: str, match: re.Match, old: str, new: str) -> str:
-    """Replace occurrences of a substring within a matched section of a given
-    text.
+    """Replace occurrences of a substring within a matched section of text.
 
     Args:
-        text (str): The input text in which replacements will be made.
-        match (re.Match): A regex match object representing the section of text to modify.
-        old (str): The substring to be replaced.
-        new (str): The substring to replace `old` with.
+        text: The input text in which replacements will be made.
+        match: A regex match object representing the section of text to modify.
+        old: The substring to be replaced.
+        new: The substring to replace `old` with.
 
     Returns:
-        str: The modified text with the specified replacements made within the matched section.
-
+        The modified text with the specified replacements made within the matched section.
     """
     start = match.start()
     end = match.end()
@@ -51,37 +99,47 @@ def replace_match(text: str, match: re.Match, old: str, new: str) -> str:
 
 
 def match_endofsentence(text: str) -> int:
-    """Finds the position of the end of a sentence in the provided text string.
+    """Find the position of the end of a sentence in the provided text.
 
-    This function processes the input text by replacing periods in email
-    addresses and numbers with ampersands to prevent them from being
-    misidentified as sentence terminals. It then searches for the end of a
-    sentence using a specified regex pattern.
+    This function uses NLTK's sentence tokenizer to detect sentence boundaries
+    in the input text, combined with punctuation verification to ensure that
+    single tokens without proper sentence endings aren't considered complete sentences.
 
     Args:
-        text (str): The input text in which to find the end of the sentence.
+        text: The input text in which to find the end of the sentence.
 
     Returns:
-        int: The position of the end of the sentence if found, otherwise 0.
-
+        The position of the end of the sentence if found, otherwise 0.
     """
     text = text.rstrip()
 
-    # Replace email dots by ampersands so we can find the end of sentence. For
-    # example, first.last@email.com becomes first&last@email&com.
-    emails = list(EMAIL_PATTERN.finditer(text))
-    for email_match in emails:
-        text = replace_match(text, email_match, ".", "&")
+    if not text:
+        return 0
 
-    # Replace number dots by ampersands so we can find the end of sentence.
-    numbers = list(NUMBER_PATTERN.finditer(text))
-    for number_match in numbers:
-        text = replace_match(text, number_match, ".", "&")
+    # Use NLTK's sentence tokenizer to find sentence boundaries
+    sentences = sent_tokenize(text)
 
-    # Match against the new text.
-    match = ENDOFSENTENCE_PATTERN.search(text)
+    if not sentences:
+        return 0
 
-    return match.end() if match else 0
+    first_sentence = sentences[0]
+
+    # If there's only one sentence that equals the entire text,
+    # verify it actually ends with sentence-ending punctuation.
+    # This is required as NLTK may return a single sentence for
+    # text that's a single word. In the case of LLM tokens, it's
+    # common for text to be single words, so we need to ensure
+    # sentence-ending punctuation is present.
+    if len(sentences) == 1 and first_sentence == text:
+        return len(text) if text and text[-1] in SENTENCE_ENDING_PUNCTUATION else 0
+
+    # If there are multiple sentences, the first one is complete by definition
+    # (NLTK found a boundary, so there must be proper punctuation)
+    if len(sentences) > 1:
+        return len(first_sentence)
+
+    # Single sentence that doesn't equal the full text means incomplete
+    return 0
 
 
 def parse_start_end_tags(
@@ -90,24 +148,22 @@ def parse_start_end_tags(
     current_tag: Optional[StartEndTags],
     current_tag_index: int,
 ) -> Tuple[Optional[StartEndTags], int]:
-    """Parses the given text to identify a pair of start/end tags.
+    """Parse text to identify start and end tag pairs.
 
-    If a start tag was previously found (i.e. current_tags is valid), wait for
-    the corresponding end tag.  Otherwise, wait for a start tag.
+    If a start tag was previously found (i.e., current_tag is valid), wait for
+    the corresponding end tag. Otherwise, wait for a start tag.
 
-    This function will return the index in the text that we should start parsing
+    This function returns the index in the text where parsing should continue
     in the next call and the current or new tags.
 
-    Parameters:
-    - text (str): The text to be parsed.
-    - tags (Sequence[StartEndTags]): List of tuples containing start and end tags.
-    - current_tags (Optional[StartEndTags]): The currently active tags, if any.
-    - current_tags_index (int): The current index in the text.
+    Args:
+        text: The text to be parsed.
+        tags: List of tuples containing start and end tags.
+        current_tag: The currently active tags, if any.
+        current_tag_index: The current index in the text.
 
     Returns:
-    Tuple[Optional[StartEndTags], int]: A tuple containing None or the current
-    tag and the index of the text.
-
+        A tuple containing None or the current tag and the index of the text.
     """
     # If we are already inside a tag, check if the end tag is in the text.
     if current_tag:

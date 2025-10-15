@@ -41,9 +41,15 @@ T = TypeVar("T")
 R = TypeVar("R")
 
 
-# Internal helper functions
 def _noop_decorator(func):
-    """No-op fallback decorator when tracing is unavailable."""
+    """No-op fallback decorator when tracing is unavailable.
+
+    Args:
+        func: The function to pass through unchanged.
+
+    Returns:
+        The original function unchanged.
+    """
     return func
 
 
@@ -53,10 +59,10 @@ def _get_parent_service_context(self):
     This looks for the service span that was created when the service was initialized.
 
     Args:
-        self: The service instance
+        self: The service instance.
 
     Returns:
-        Context or None: The parent service context, or None if unavailable
+        The parent service context, or None if unavailable.
     """
     if not is_tracing_available():
         return None
@@ -73,8 +79,8 @@ def _add_token_usage_to_span(span, token_usage):
     """Add token usage metrics to a span (internal use only).
 
     Args:
-        span: The span to add token metrics to
-        token_usage: Dictionary or object containing token usage information
+        span: The span to add token metrics to.
+        token_usage: Dictionary or object containing token usage information.
     """
     if not is_tracing_available() or not token_usage:
         return
@@ -93,9 +99,10 @@ def _add_token_usage_to_span(span, token_usage):
 
 
 def traced_tts(func: Optional[Callable] = None, *, name: Optional[str] = None) -> Callable:
-    """Traces TTS service methods with TTS-specific attributes.
+    """Trace TTS service methods with TTS-specific attributes.
 
     Automatically captures and records:
+
     - Service name and model information
     - Voice ID and settings
     - Character count and text content
@@ -118,8 +125,17 @@ def traced_tts(func: Optional[Callable] = None, *, name: Optional[str] = None) -
 
         @contextlib.asynccontextmanager
         async def tracing_context(self, text):
-            """Async context manager for TTS tracing."""
-            if not is_tracing_available():
+            """Async context manager for TTS tracing.
+
+            Args:
+                self: The TTS service instance.
+                text: The text being synthesized.
+
+            Yields:
+                The active span for the TTS operation.
+            """
+            # Check if tracing is enabled for this service instance
+            if not getattr(self, "_tracing_enabled", False):
                 yield None
                 return
 
@@ -163,7 +179,8 @@ def traced_tts(func: Optional[Callable] = None, *, name: Optional[str] = None) -
             @functools.wraps(f)
             async def gen_wrapper(self, text, *args, **kwargs):
                 try:
-                    if not is_tracing_available():
+                    # Check if tracing is enabled for this service instance
+                    if not getattr(self, "_tracing_enabled", False):
                         async for item in f(self, text, *args, **kwargs):
                             yield item
                         return
@@ -183,7 +200,8 @@ def traced_tts(func: Optional[Callable] = None, *, name: Optional[str] = None) -
             @functools.wraps(f)
             async def wrapper(self, text, *args, **kwargs):
                 try:
-                    if not is_tracing_available():
+                    # Check if tracing is enabled for this service instance
+                    if not getattr(self, "_tracing_enabled", False):
                         return await f(self, text, *args, **kwargs)
 
                     async with tracing_context(self, text):
@@ -201,9 +219,10 @@ def traced_tts(func: Optional[Callable] = None, *, name: Optional[str] = None) -
 
 
 def traced_stt(func: Optional[Callable] = None, *, name: Optional[str] = None) -> Callable:
-    """Traces STT service methods with transcription attributes.
+    """Trace STT service methods with transcription attributes.
 
     Automatically captures and records:
+
     - Service name and model information
     - Transcription text and final status
     - Language information
@@ -223,7 +242,8 @@ def traced_stt(func: Optional[Callable] = None, *, name: Optional[str] = None) -
         @functools.wraps(f)
         async def wrapper(self, transcript, is_final, language=None):
             try:
-                if not is_tracing_available():
+                # Check if tracing is enabled for this service instance
+                if not getattr(self, "_tracing_enabled", False):
                     return await f(self, transcript, is_final, language)
 
                 service_class_name = self.__class__.__name__
@@ -254,6 +274,7 @@ def traced_stt(func: Optional[Callable] = None, *, name: Optional[str] = None) -
                             transcript=transcript,
                             is_final=is_final,
                             language=str(language) if language else None,
+                            user_id=getattr(self, "_user_id", None),
                             vad_enabled=getattr(self, "vad_enabled", False),
                             settings=settings,
                             ttfb=ttfb,
@@ -278,9 +299,10 @@ def traced_stt(func: Optional[Callable] = None, *, name: Optional[str] = None) -
 
 
 def traced_llm(func: Optional[Callable] = None, *, name: Optional[str] = None) -> Callable:
-    """Traces LLM service methods with LLM-specific attributes.
+    """Trace LLM service methods with LLM-specific attributes.
 
     Automatically captures and records:
+
     - Service name and model information
     - Context content and messages
     - Tool configurations
@@ -302,7 +324,8 @@ def traced_llm(func: Optional[Callable] = None, *, name: Optional[str] = None) -
         @functools.wraps(f)
         async def wrapper(self, context, *args, **kwargs):
             try:
-                if not is_tracing_available():
+                # Check if tracing is enabled for this service instance
+                if not getattr(self, "_tracing_enabled", False):
                     return await f(self, context, *args, **kwargs)
 
                 service_class_name = self.__class__.__name__
@@ -482,16 +505,17 @@ def traced_llm(func: Optional[Callable] = None, *, name: Optional[str] = None) -
 
 
 def traced_gemini_live(operation: str) -> Callable:
-    """Traces Gemini Live service methods with operation-specific attributes.
+    """Trace Gemini Live service methods with operation-specific attributes.
 
     This decorator automatically captures relevant information based on the operation type:
+
     - llm_setup: Configuration, tools definitions, and system instructions
     - llm_tool_call: Function call information
     - llm_tool_result: Function execution results
     - llm_response: Complete LLM response with usage and output
 
     Args:
-        operation: The operation name (matches the event type being handled)
+        operation: The operation name (matches the event type being handled).
 
     Returns:
         Wrapped method with Gemini Live specific tracing.
@@ -503,7 +527,8 @@ def traced_gemini_live(operation: str) -> Callable:
         @functools.wraps(func)
         async def wrapper(self, *args, **kwargs):
             try:
-                if not is_tracing_available():
+                # Check if tracing is enabled for this service instance
+                if not getattr(self, "_tracing_enabled", False):
                     return await func(self, *args, **kwargs)
 
                 service_class_name = self.__class__.__name__
@@ -786,15 +811,16 @@ def traced_gemini_live(operation: str) -> Callable:
 
 
 def traced_openai_realtime(operation: str) -> Callable:
-    """Traces OpenAI Realtime service methods with operation-specific attributes.
+    """Trace OpenAI Realtime service methods with operation-specific attributes.
 
     This decorator automatically captures relevant information based on the operation type:
+
     - llm_setup: Session configuration and tools
     - llm_request: Context and input messages
     - llm_response: Usage metadata, output, and function calls
 
     Args:
-        operation: The operation name (matches the event type being handled)
+        operation: The operation name (matches the event type being handled).
 
     Returns:
         Wrapped method with OpenAI Realtime specific tracing.
@@ -806,7 +832,8 @@ def traced_openai_realtime(operation: str) -> Callable:
         @functools.wraps(func)
         async def wrapper(self, *args, **kwargs):
             try:
-                if not is_tracing_available():
+                # Check if tracing is enabled for this service instance
+                if not getattr(self, "_tracing_enabled", False):
                     return await func(self, *args, **kwargs)
 
                 service_class_name = self.__class__.__name__

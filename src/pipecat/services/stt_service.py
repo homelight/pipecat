@@ -56,7 +56,9 @@ class STTService(AIService):
         self._init_sample_rate = sample_rate
         self._sample_rate = 0
         self._settings: Dict[str, Any] = {}
+        self._tracing_enabled: bool = False
         self._muted: bool = False
+        self._user_id: str = ""
 
     @property
     def is_muted(self) -> bool:
@@ -115,6 +117,7 @@ class STTService(AIService):
         """
         await super().start(frame)
         self._sample_rate = self._init_sample_rate or frame.audio_in_sample_rate
+        self._tracing_enabled = frame.enable_tracing
 
     async def _update_settings(self, settings: Mapping[str, Any]):
         logger.info(f"Updating STT settings: {self._settings}")
@@ -132,11 +135,30 @@ class STTService(AIService):
     async def process_audio_frame(self, frame: AudioRawFrame, direction: FrameDirection):
         """Process an audio frame for speech recognition.
 
+        If the service is muted, this method does nothing. Otherwise, it
+        processes the audio frame and runs speech-to-text on it, yielding
+        transcription results. If the frame has a user_id, it is stored
+        for later use in transcription.
+
         Args:
             frame: The audio frame to process.
             direction: The direction of frame processing.
         """
         if self._muted:
+            return
+
+        # UserAudioRawFrame contains a user_id (e.g. Daily, Livekit)
+        if hasattr(frame, "user_id"):
+            self._user_id = frame.user_id
+        # AudioRawFrame does not have a user_id (e.g. SmallWebRTCTransport, websockets)
+        else:
+            self._user_id = ""
+
+        if not frame.audio:
+            # Ignoring in case we don't have audio to transcribe.
+            logger.warning(
+                f"Empty audio frame received for STT service: {self.name} {frame.num_frames}"
+            )
             return
 
         await self.process_generator(self.run_stt(frame.audio))
@@ -241,10 +263,19 @@ class SegmentedSTTService(STTService):
         Continuously buffers audio, growing the buffer while user is speaking and
         maintaining a small buffer when not speaking to account for VAD delay.
 
+        If the frame has a user_id, it is stored for later use in transcription.
+
         Args:
             frame: The audio frame to process.
             direction: The direction of frame processing.
         """
+        # UserAudioRawFrame contains a user_id (e.g. Daily, Livekit)
+        if hasattr(frame, "user_id"):
+            self._user_id = frame.user_id
+        # AudioRawFrame does not have a user_id (e.g. SmallWebRTCTransport, websockets)
+        else:
+            self._user_id = ""
+
         # If the user is speaking the audio buffer will keep growing.
         self._audio_buffer += frame.audio
 

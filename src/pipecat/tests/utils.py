@@ -4,6 +4,8 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+"""Testing utilities for Pipecat pipeline components."""
+
 import asyncio
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
@@ -24,15 +26,27 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 @dataclass
 class SleepFrame(SystemFrame):
-    """This frame is used by test framework to introduce some sleep time before
-    the next frame is pushed. This is useful to control system frames vs data or
-    control frames.
+    """A system frame that introduces a sleep delay in the test pipeline.
+
+    This frame is used by the test framework to control timing between
+    frame processing, allowing tests to separate system frames from
+    data or control frames.
+
+    Parameters:
+        sleep: Duration to sleep in seconds before processing the next frame.
     """
 
-    sleep: float = 0.1
+    sleep: float = 0.2
 
 
 class HeartbeatsObserver(BaseObserver):
+    """Observer that monitors heartbeat frames from a specific processor.
+
+    This observer watches for HeartbeatFrames from a target processor and
+    invokes a callback when they are detected, useful for testing timing
+    and lifecycle events.
+    """
+
     def __init__(
         self,
         *,
@@ -40,11 +54,23 @@ class HeartbeatsObserver(BaseObserver):
         heartbeat_callback: Callable[[FrameProcessor, HeartbeatFrame], Awaitable[None]],
         **kwargs,
     ):
+        """Initialize the heartbeats observer.
+
+        Args:
+            target: The frame processor to monitor for heartbeat frames.
+            heartbeat_callback: Async callback function to invoke when heartbeats are detected.
+            **kwargs: Additional arguments passed to the parent observer.
+        """
         super().__init__(**kwargs)
         self._target = target
         self._callback = heartbeat_callback
 
     async def on_push_frame(self, data: FramePushed):
+        """Handle frame push events and detect heartbeats from target processor.
+
+        Args:
+            data: The frame push event data containing source and frame information.
+        """
         src = data.source
         frame = data.frame
 
@@ -53,6 +79,13 @@ class HeartbeatsObserver(BaseObserver):
 
 
 class QueuedFrameProcessor(FrameProcessor):
+    """A processor that captures frames in a queue for testing purposes.
+
+    This processor intercepts frames flowing in a specific direction and
+    stores them in a queue for later inspection during testing, while
+    still allowing the frames to continue through the pipeline.
+    """
+
     def __init__(
         self,
         *,
@@ -60,12 +93,25 @@ class QueuedFrameProcessor(FrameProcessor):
         queue_direction: FrameDirection,
         ignore_start: bool = True,
     ):
-        super().__init__()
+        """Initialize the queued frame processor.
+
+        Args:
+            queue: The asyncio queue to store captured frames.
+            queue_direction: The direction of frames to capture (UPSTREAM or DOWNSTREAM).
+            ignore_start: Whether to ignore StartFrames when capturing.
+        """
+        super().__init__(enable_direct_mode=True)
         self._queue = queue
         self._queue_direction = queue_direction
         self._ignore_start = ignore_start
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
+        """Process frames and capture them in the queue if they match the direction.
+
+        Args:
+            frame: The frame to process.
+            direction: The direction the frame is flowing.
+        """
         await super().process_frame(frame, direction)
 
         if direction == self._queue_direction:
@@ -82,11 +128,33 @@ async def run_test(
     expected_up_frames: Optional[Sequence[type]] = None,
     ignore_start: bool = True,
     observers: Optional[List[BaseObserver]] = None,
-    start_metadata: Optional[Dict[str, Any]] = None,
+    pipeline_params: Optional[PipelineParams] = None,
     send_end_frame: bool = True,
 ) -> Tuple[Sequence[Frame], Sequence[Frame]]:
+    """Run a test pipeline with the specified processor and validate frame flow.
+
+    This function creates a test pipeline with the given processor, sends the
+    specified frames through it, and validates that the expected frames are
+    received in both upstream and downstream directions.
+
+    Args:
+        processor: The frame processor to test.
+        frames_to_send: Sequence of frames to send through the processor.
+        expected_down_frames: Expected frame types flowing downstream (optional).
+        expected_up_frames: Expected frame types flowing upstream (optional).
+        ignore_start: Whether to ignore StartFrames in frame validation.
+        observers: Optional list of observers to attach to the pipeline.
+        pipeline_params: Optional pipeline parameters.
+        send_end_frame: Whether to send an EndFrame at the end of the test.
+
+    Returns:
+        Tuple containing (downstream_frames, upstream_frames) that were received.
+
+    Raises:
+        AssertionError: If the received frames don't match the expected frame types.
+    """
     observers = observers or []
-    start_metadata = start_metadata or {}
+    pipeline_params = pipeline_params or PipelineParams()
 
     received_up = asyncio.Queue()
     received_down = asyncio.Queue()
@@ -105,7 +173,7 @@ async def run_test(
 
     task = PipelineTask(
         pipeline,
-        params=PipelineParams(start_metadata=start_metadata),
+        params=pipeline_params,
         observers=observers,
         cancel_on_idle_timeout=False,
     )

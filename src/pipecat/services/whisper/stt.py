@@ -49,8 +49,10 @@ class Model(Enum):
     Parameters:
         TINY: Smallest multilingual model, fastest inference.
         BASE: Basic multilingual model, good speed/quality balance.
+        SMALL: Small multilingual model, better speed/quality balance than BASE.
         MEDIUM: Medium-sized multilingual model, better quality.
         LARGE: Best quality multilingual model, slower inference.
+        LARGE_V3_TURBO: Fast multilingual model, slightly lower quality than LARGE.
         DISTIL_LARGE_V2: Fast multilingual distilled model.
         DISTIL_MEDIUM_EN: Fast English-only distilled model.
     """
@@ -58,8 +60,10 @@ class Model(Enum):
     # Multilingual models
     TINY = "tiny"
     BASE = "base"
+    SMALL = "small"
     MEDIUM = "medium"
     LARGE = "large-v3"
+    LARGE_V3_TURBO = "deepdml/faster-whisper-large-v3-turbo-ct2"
     DISTIL_LARGE_V2 = "Systran/faster-distil-whisper-large-v2"
 
     # English-only models
@@ -395,7 +399,12 @@ class WhisperSTTService(SegmentedSTTService):
         if text:
             await self._handle_transcription(text, True, self._settings["language"])
             logger.debug(f"Transcription: [{text}]")
-            yield TranscriptionFrame(text, "", time_now_iso8601(), self._settings["language"])
+            yield TranscriptionFrame(
+                text,
+                self._user_id,
+                time_now_iso8601(),
+                self._settings["language"],
+            )
 
 
 class WhisperSTTServiceMLX(WhisperSTTService):
@@ -500,7 +509,12 @@ class WhisperSTTServiceMLX(WhisperSTTService):
             if text:
                 await self._handle_transcription(text, True, self._settings["language"])
                 logger.debug(f"Transcription: [{text}]")
-                yield TranscriptionFrame(text, "", time_now_iso8601(), self._settings["language"])
+                yield TranscriptionFrame(
+                    text,
+                    self._user_id,
+                    time_now_iso8601(),
+                    self._settings["language"],
+                )
 
         except Exception as e:
             logger.exception(f"MLX Whisper transcription error: {e}")

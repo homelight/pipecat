@@ -16,28 +16,29 @@ import json
 import os
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 from loguru import logger
 from PIL import Image
 from pydantic import BaseModel, Field
 
-from pipecat.adapters.services.gemini_adapter import GeminiLLMAdapter
+from pipecat.adapters.services.gemini_adapter import GeminiLLMAdapter, GeminiLLMInvocationParams
 from pipecat.frames.frames import (
     AudioRawFrame,
     Frame,
     FunctionCallCancelFrame,
     FunctionCallInProgressFrame,
     FunctionCallResultFrame,
+    LLMContextFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMMessagesFrame,
     LLMTextFrame,
     LLMUpdateSettingsFrame,
     UserImageRawFrame,
-    VisionImageRawFrame,
 )
 from pipecat.metrics.metrics import LLMTokenUsage
+from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response import (
     LLMAssistantAggregatorParams,
     LLMUserAggregatorParams,
@@ -53,7 +54,6 @@ from pipecat.services.openai.llm import (
     OpenAIAssistantContextAggregator,
     OpenAIUserContextAggregator,
 )
-from pipecat.utils.asyncio.watchdog_async_iterator import WatchdogAsyncIterator
 from pipecat.utils.tracing.service_decorators import traced_llm
 
 # Suppress gRPC fork warnings
@@ -68,6 +68,8 @@ try:
         FunctionCall,
         FunctionResponse,
         GenerateContentConfig,
+        GenerateContentResponse,
+        HttpOptions,
         Part,
     )
 except ModuleNotFoundError as e:
@@ -83,21 +85,13 @@ class GoogleUserContextAggregator(OpenAIUserContextAggregator):
     Content and Part message format for user messages.
     """
 
-    async def push_aggregation(self):
-        """Push aggregated user text as a Google Content message."""
-        if len(self._aggregation) > 0:
-            self._context.add_message(Content(role="user", parts=[Part(text=self._aggregation)]))
+    async def handle_aggregation(self, aggregation: str):
+        """Add the aggregated user text to the context as a Google Content message.
 
-            # Reset the aggregation. Reset it before pushing it down, otherwise
-            # if the tasks gets cancelled we won't be able to clear things up.
-            self._aggregation = ""
-
-            # Push context frame
-            frame = OpenAILLMContextFrame(self._context)
-            await self.push_frame(frame)
-
-            # Reset our accumulator state.
-            await self.reset()
+        Args:
+            aggregation: The aggregated user text to add as a user message.
+        """
+        self._context.add_message(Content(role="user", parts=[Part(text=aggregation)]))
 
 
 class GoogleAssistantContextAggregator(OpenAIAssistantContextAggregator):
@@ -297,11 +291,11 @@ class GoogleLLMContext(OpenAILLMContext):
         # Add the converted messages to our existing messages
         self._messages.extend(converted_messages)
 
-    def get_messages_for_logging(self):
+    def get_messages_for_logging(self) -> List[Dict[str, Any]]:
         """Get messages formatted for logging with sensitive data redacted.
 
         Returns:
-            List of message dictionaries with inline data redacted.
+            List of messages in a format ready for logging.
         """
         msgs = []
         for message in self.messages:
@@ -380,23 +374,60 @@ class GoogleLLMContext(OpenAILLMContext):
         System messages are stored separately and return None.
 
         Args:
-            message: Message in standard format:
-                {
-                    "role": "user/assistant/system/tool",
-                    "content": str | [{"type": "text/image_url", ...}] | None,
-                    "tool_calls": [{"function": {"name": str, "arguments": str}}]
-                }
+            message: Message in standard format.
 
         Returns:
-            Content object with:
-                - role: "user" or "model" (converted from "assistant")
-                - parts: List[Part] containing text, inline_data, or function calls
-            Returns None for system messages.
+            Content object with role and parts, or None for system messages.
+
+        Examples:
+            Standard text message::
+
+                {
+                    "role": "user",
+                    "content": "Hello there"
+                }
+
+            Converts to Google Content with::
+
+                Content(
+                    role="user",
+                    parts=[Part(text="Hello there")]
+                )
+
+            Standard function call message::
+
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": "search",
+                                "arguments": '{"query": "test"}'
+                            }
+                        }
+                    ]
+                }
+
+            Converts to Google Content with::
+
+                Content(
+                    role="model",
+                    parts=[Part(function_call=FunctionCall(name="search", args={"query": "test"}))]
+                )
+
+            System message returns None and stores content in self.system_message.
         """
         role = message["role"]
         content = message.get("content", [])
         if role == "system":
-            self.system_message = content
+            # System instructions are returned as plain text
+            if isinstance(content, str):
+                self.system_message = content
+            elif isinstance(content, list):
+                # If content is a list, we assume it's a list of text parts, per the standard
+                self.system_message = " ".join(
+                    part["text"] for part in content if part.get("type") == "text"
+                )
             return None
         elif role == "assistant":
             role = "model"
@@ -414,11 +445,20 @@ class GoogleLLMContext(OpenAILLMContext):
                 )
         elif role == "tool":
             role = "model"
+            try:
+                response = json.loads(message["content"])
+                if isinstance(response, dict):
+                    response_dict = response
+                else:
+                    response_dict = {"value": response}
+            except Exception as e:
+                # Response might not be JSON-deserializable (e.g. plain text).
+                response_dict = {"value": message["content"]}
             parts.append(
                 Part(
                     function_response=FunctionResponse(
                         name="tool_call_result",  # seems to work to hard-code the same name every time
-                        response=json.loads(message["content"]),
+                        response=response_dict,
                     )
                 )
             )
@@ -447,21 +487,73 @@ class GoogleLLMContext(OpenAILLMContext):
         Handles text, images, and function calls from Google's Content/Part objects.
 
         Args:
-            obj: Google Content object with:
-                - role: "model" (converted to "assistant") or "user"
-                - parts: List[Part] containing text, inline_data, or function calls
+            obj: Google Content object with role and parts.
 
         Returns:
-            List of messages in standard format:
-            [
-                {
-                    "role": "user/assistant/tool",
-                    "content": [
-                        {"type": "text", "text": str} |
-                        {"type": "image_url", "image_url": {"url": str}}
-                    ]
-                }
-            ]
+            List containing a single message in standard format.
+
+        Examples:
+            Google Content with text::
+
+                Content(
+                    role="user",
+                    parts=[Part(text="Hello")]
+                )
+
+            Converts to::
+
+                [
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "Hello"}]
+                    }
+                ]
+
+            Google Content with function call::
+
+                Content(
+                    role="model",
+                    parts=[Part(function_call=FunctionCall(name="search", args={"q": "test"}))]
+                )
+
+            Converts to::
+
+                [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "search",
+                                "type": "function",
+                                "function": {
+                                    "name": "search",
+                                    "arguments": '{"q": "test"}'
+                                }
+                            }
+                        ]
+                    }
+                ]
+
+            Google Content with image::
+
+                Content(
+                    role="user",
+                    parts=[Part(inline_data=Blob(mime_type="image/jpeg", data=bytes_data))]
+                )
+
+            Converts to::
+
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/jpeg;base64,<encoded_data>"}
+                            }
+                        ]
+                    }
+                ]
         """
         msg = {"role": obj.role, "content": []}
         if msg["role"] == "model":
@@ -544,9 +636,9 @@ class GoogleLLMContext(OpenAILLMContext):
         # Check if we only have function-related messages (no regular text)
         has_regular_messages = any(
             len(msg.parts) == 1
-            and not getattr(msg.parts[0], "text", None)
-            and getattr(msg.parts[0], "function_call", None)
-            and getattr(msg.parts[0], "function_response", None)
+            and getattr(msg.parts[0], "text", None)
+            and not getattr(msg.parts[0], "function_call", None)
+            and not getattr(msg.parts[0], "function_response", None)
             for msg in self._messages
         )
 
@@ -562,9 +654,8 @@ class GoogleLLMService(LLMService):
     """Google AI (Gemini) LLM service implementation.
 
     This class implements inference with Google's AI models, translating internally
-    from OpenAILLMContext to the messages format expected by the Google AI model.
-    We use OpenAILLMContext as a lingua franca for all LLM services to enable
-    easy switching between different LLMs.
+    from an OpenAILLMContext or a universal LLMContext to the messages format
+    expected by the Google AI model.
     """
 
     # Overriding the default adapter to use the Gemini one.
@@ -596,6 +687,7 @@ class GoogleLLMService(LLMService):
         system_instruction: Optional[str] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_config: Optional[Dict[str, Any]] = None,
+        http_options: Optional[HttpOptions] = None,
         **kwargs,
     ):
         """Initialize the Google LLM service.
@@ -607,6 +699,7 @@ class GoogleLLMService(LLMService):
             system_instruction: System instruction/prompt for the model.
             tools: List of available tools/functions.
             tool_config: Configuration for tool usage.
+            http_options: HTTP options for the client.
             **kwargs: Additional arguments passed to parent class.
         """
         super().__init__(**kwargs)
@@ -616,7 +709,8 @@ class GoogleLLMService(LLMService):
         self.set_model_name(model)
         self._api_key = api_key
         self._system_instruction = system_instruction
-        self._create_client(api_key)
+        self._http_options = http_options
+        self._create_client(api_key, http_options)
         self._settings = {
             "max_tokens": params.max_tokens,
             "temperature": params.temperature,
@@ -635,74 +729,182 @@ class GoogleLLMService(LLMService):
         """
         return True
 
-    def _create_client(self, api_key: str):
-        self._client = genai.Client(api_key=api_key)
+    def _create_client(self, api_key: str, http_options: Optional[HttpOptions] = None):
+        self._client = genai.Client(api_key=api_key, http_options=http_options)
+
+    async def run_inference(self, context: LLMContext | OpenAILLMContext) -> Optional[str]:
+        """Run a one-shot, out-of-band (i.e. out-of-pipeline) inference with the given LLM context.
+
+        Args:
+            context: The LLM context containing conversation history.
+
+        Returns:
+            The LLM's response as a string, or None if no response is generated.
+        """
+        messages = []
+        system = []
+        if isinstance(context, LLMContext):
+            adapter = self.get_llm_adapter()
+            params: GeminiLLMInvocationParams = adapter.get_llm_invocation_params(context)
+            messages = params["messages"]
+            system = params["system_instruction"]
+        else:
+            context = GoogleLLMContext.upgrade_to_google(context)
+            messages = context.messages
+            system = getattr(context, "system_message", None)
+
+        generation_config = GenerateContentConfig(system_instruction=system)
+
+        # Use the new google-genai client's async method
+        response = await self._client.aio.models.generate_content(
+            model=self._model_name,
+            contents=messages,
+            config=generation_config,
+        )
+
+        # Extract text from response
+        if response.candidates and response.candidates[0].content:
+            for part in response.candidates[0].content.parts:
+                if part.text:
+                    return part.text
+
+        return None
+
+    def needs_mcp_alternate_schema(self) -> bool:
+        """Check if this LLM service requires alternate MCP schema.
+
+        Google/Gemini has stricter JSON schema validation and requires
+        certain properties to be removed or modified for compatibility.
+
+        Returns:
+            True for Google/Gemini services.
+        """
+        return True
+
+    def _maybe_unset_thinking_budget(self, generation_params: Dict[str, Any]):
+        try:
+            # There's no way to introspect on model capabilities, so
+            # to check for models that we know default to thinkin on
+            # and can be configured to turn it off.
+            if not self._model_name.startswith("gemini-2.5-flash"):
+                return
+            # If thinking_config is already set, don't override it.
+            if "thinking_config" in generation_params:
+                return
+            generation_params.setdefault("thinking_config", {})["thinking_budget"] = 0
+        except Exception as e:
+            logger.exception(f"Failed to unset thinking budget: {e}")
+
+    async def _stream_content(
+        self, params_from_context: GeminiLLMInvocationParams
+    ) -> AsyncIterator[GenerateContentResponse]:
+        messages = params_from_context["messages"]
+        if (
+            params_from_context["system_instruction"]
+            and self._system_instruction != params_from_context["system_instruction"]
+        ):
+            logger.debug(f"System instruction changed: {params_from_context['system_instruction']}")
+            self._system_instruction = params_from_context["system_instruction"]
+
+        tools = []
+        if params_from_context["tools"]:
+            tools = params_from_context["tools"]
+        elif self._tools:
+            tools = self._tools
+        tool_config = None
+        if self._tool_config:
+            tool_config = self._tool_config
+
+        # Filter out None values and create GenerationContentConfig
+        generation_params = {
+            k: v
+            for k, v in {
+                "system_instruction": self._system_instruction,
+                "temperature": self._settings["temperature"],
+                "top_p": self._settings["top_p"],
+                "top_k": self._settings["top_k"],
+                "max_output_tokens": self._settings["max_tokens"],
+                "tools": tools,
+                "tool_config": tool_config,
+            }.items()
+            if v is not None
+        }
+
+        if self._settings["extra"]:
+            generation_params.update(self._settings["extra"])
+
+        # possibly modify generation_params (in place) to set thinking to off by default
+        self._maybe_unset_thinking_budget(generation_params)
+
+        generation_config = (
+            GenerateContentConfig(**generation_params) if generation_params else None
+        )
+
+        await self.start_ttfb_metrics()
+        return await self._client.aio.models.generate_content_stream(
+            model=self._model_name,
+            contents=messages,
+            config=generation_config,
+        )
+
+    async def _stream_content_specific_context(
+        self, context: OpenAILLMContext
+    ) -> AsyncIterator[GenerateContentResponse]:
+        logger.debug(
+            f"{self}: Generating chat from LLM-specific context [{context.system_message}] | {context.get_messages_for_logging()}"
+        )
+
+        params = GeminiLLMInvocationParams(
+            messages=context.messages,
+            system_instruction=context.system_message,
+            tools=context.tools,
+        )
+
+        return await self._stream_content(params)
+
+    async def _stream_content_universal_context(
+        self, context: LLMContext
+    ) -> AsyncIterator[GenerateContentResponse]:
+        adapter = self.get_llm_adapter()
+        params: GeminiLLMInvocationParams = adapter.get_llm_invocation_params(context)
+
+        logger.debug(
+            f"{self}: Generating chat from universal context [{params['system_instruction']}] | {adapter.get_messages_for_logging(context)}"
+        )
+
+        return await self._stream_content(params)
 
     @traced_llm
-    async def _process_context(self, context: OpenAILLMContext):
+    async def _process_context(self, context: OpenAILLMContext | LLMContext):
         await self.push_frame(LLMFullResponseStartFrame())
 
         prompt_tokens = 0
         completion_tokens = 0
         total_tokens = 0
+        cache_read_input_tokens = 0
+        reasoning_tokens = 0
 
         grounding_metadata = None
         search_result = ""
 
         try:
-            logger.debug(
-                # f"{self}: Generating chat [{self._system_instruction}] | [{context.get_messages_for_logging()}]"
-                f"{self}: Generating chat [{context.get_messages_for_logging()}]"
-            )
-
-            messages = context.messages
-            if context.system_message and self._system_instruction != context.system_message:
-                logger.debug(f"System instruction changed: {context.system_message}")
-                self._system_instruction = context.system_message
-
-            tools = []
-            if context.tools:
-                tools = context.tools
-            elif self._tools:
-                tools = self._tools
-            tool_config = None
-            if self._tool_config:
-                tool_config = self._tool_config
-
-            # Filter out None values and create GenerationContentConfig
-            generation_params = {
-                k: v
-                for k, v in {
-                    "system_instruction": self._system_instruction,
-                    "temperature": self._settings["temperature"],
-                    "top_p": self._settings["top_p"],
-                    "top_k": self._settings["top_k"],
-                    "max_output_tokens": self._settings["max_tokens"],
-                    "tools": tools,
-                    "tool_config": tool_config,
-                }.items()
-                if v is not None
-            }
-
-            generation_config = (
-                GenerateContentConfig(**generation_params) if generation_params else None
-            )
-
-            await self.start_ttfb_metrics()
-            response = await self._client.aio.models.generate_content_stream(
-                model=self._model_name,
-                contents=messages,
-                config=generation_config,
+            # Generate content using either OpenAILLMContext or universal LLMContext
+            response = await (
+                self._stream_content_specific_context(context)
+                if isinstance(context, OpenAILLMContext)
+                else self._stream_content_universal_context(context)
             )
 
             function_calls = []
-            async for chunk in WatchdogAsyncIterator(response, manager=self.task_manager):
+            async for chunk in response:
                 # Stop TTFB metrics after the first chunk
                 await self.stop_ttfb_metrics()
                 if chunk.usage_metadata:
                     prompt_tokens += chunk.usage_metadata.prompt_token_count or 0
                     completion_tokens += chunk.usage_metadata.candidates_token_count or 0
                     total_tokens += chunk.usage_metadata.total_token_count or 0
+                    cache_read_input_tokens += chunk.usage_metadata.cached_content_token_count or 0
+                    reasoning_tokens += chunk.usage_metadata.thoughts_token_count or 0
 
                 if not chunk.candidates:
                     continue
@@ -784,6 +986,8 @@ class GoogleLLMService(LLMService):
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     total_tokens=total_tokens,
+                    cache_read_input_tokens=cache_read_input_tokens,
+                    reasoning_tokens=reasoning_tokens,
                 )
             )
             await self.push_frame(LLMFullResponseEndFrame())
@@ -801,13 +1005,13 @@ class GoogleLLMService(LLMService):
 
         if isinstance(frame, OpenAILLMContextFrame):
             context = GoogleLLMContext.upgrade_to_google(frame.context)
+        elif isinstance(frame, LLMContextFrame):
+            # Handle universal (LLM-agnostic) LLM context frames
+            context = frame.context
         elif isinstance(frame, LLMMessagesFrame):
+            # NOTE: LLMMessagesFrame is deprecated, so we don't support the newer universal
+            # LLMContext with it
             context = GoogleLLMContext(frame.messages)
-        elif isinstance(frame, VisionImageRawFrame):
-            context = GoogleLLMContext()
-            context.add_image_frame_message(
-                format=frame.format, size=frame.size, image=frame.image, text=frame.text
-            )
         elif isinstance(frame, LLMUpdateSettingsFrame):
             await self._update_settings(frame.settings)
         else:

@@ -4,9 +4,14 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+"""Base output transport implementation for Pipecat.
+
+This module provides the BaseOutputTransport class which handles audio and video
+output processing, including frame buffering, mixing, timing, and media streaming.
+"""
+
 import asyncio
 import itertools
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, AsyncGenerator, Dict, List, Mapping, Optional
@@ -14,8 +19,9 @@ from typing import Any, AsyncGenerator, Dict, List, Mapping, Optional
 from loguru import logger
 from PIL import Image
 
+from pipecat.audio.dtmf.utils import load_dtmf_audio
 from pipecat.audio.mixers.base_audio_mixer import BaseAudioMixer
-from pipecat.audio.utils import create_default_resampler
+from pipecat.audio.utils import create_stream_resampler, is_silence
 from pipecat.frames.frames import (
     BotSpeakingFrame,
     BotStartedSpeakingFrame,
@@ -23,15 +29,17 @@ from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
     Frame,
+    InputTransportMessageUrgentFrame,
+    InterruptionFrame,
     MixerControlFrame,
     OutputAudioRawFrame,
     OutputDTMFFrame,
     OutputDTMFUrgentFrame,
     OutputImageRawFrame,
+    OutputTransportReadyFrame,
+    SpeechOutputAudioRawFrame,
     SpriteFrame,
     StartFrame,
-    StartInterruptionFrame,
-    StopInterruptionFrame,
     SystemFrame,
     TransportMessageFrame,
     TransportMessageUrgentFrame,
@@ -39,14 +47,26 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.transports.base_transport import TransportParams
-from pipecat.utils.asyncio.watchdog_priority_queue import WatchdogPriorityQueue
 from pipecat.utils.time import nanoseconds_to_seconds
 
 BOT_VAD_STOP_SECS = 0.35
 
 
 class BaseOutputTransport(FrameProcessor):
+    """Base class for output transport implementations.
+
+    Handles audio and video output processing including frame buffering, audio mixing,
+    timing coordination, and media streaming. Supports multiple output destinations
+    and provides interruption handling for real-time communication.
+    """
+
     def __init__(self, params: TransportParams, **kwargs):
+        """Initialize the base output transport.
+
+        Args:
+            params: Transport configuration parameters.
+            **kwargs: Additional arguments passed to parent class.
+        """
         super().__init__(**kwargs)
 
         self._params = params
@@ -67,13 +87,28 @@ class BaseOutputTransport(FrameProcessor):
 
     @property
     def sample_rate(self) -> int:
+        """Get the current audio sample rate.
+
+        Returns:
+            The sample rate in Hz.
+        """
         return self._sample_rate
 
     @property
     def audio_chunk_size(self) -> int:
+        """Get the audio chunk size for output processing.
+
+        Returns:
+            The size of audio chunks in bytes.
+        """
         return self._audio_chunk_size
 
     async def start(self, frame: StartFrame):
+        """Start the output transport and initialize components.
+
+        Args:
+            frame: The start frame containing initialization parameters.
+        """
         self._sample_rate = self._params.audio_out_sample_rate or frame.audio_out_sample_rate
 
         # We will write 10ms*CHUNKS of audio at a time (where CHUNKS is the
@@ -83,15 +118,29 @@ class BaseOutputTransport(FrameProcessor):
         self._audio_chunk_size = audio_bytes_10ms * self._params.audio_out_10ms_chunks
 
     async def stop(self, frame: EndFrame):
+        """Stop the output transport and cleanup resources.
+
+        Args:
+            frame: The end frame signaling transport shutdown.
+        """
         for _, sender in self._media_senders.items():
             await sender.stop(frame)
 
     async def cancel(self, frame: CancelFrame):
+        """Cancel the output transport and stop all processing.
+
+        Args:
+            frame: The cancel frame signaling immediate cancellation.
+        """
         for _, sender in self._media_senders.items():
             await sender.cancel(frame)
 
     async def set_transport_ready(self, frame: StartFrame):
-        """To be called when the transport is ready to stream."""
+        """Called when the transport is ready to stream.
+
+        Args:
+            frame: The start frame containing initialization parameters.
+        """
         # Register destinations.
         for destination in self._params.audio_out_destinations:
             await self.register_audio_destination(destination)
@@ -126,28 +175,102 @@ class BaseOutputTransport(FrameProcessor):
             )
             await self._media_senders[destination].start(frame)
 
+        # Sending a frame indicating that the output transport is ready and able to receive frames.
+        await self.push_frame(OutputTransportReadyFrame(), FrameDirection.UPSTREAM)
+
     async def send_message(self, frame: TransportMessageFrame | TransportMessageUrgentFrame):
+        """Send a transport message.
+
+        Args:
+            frame: The transport message frame to send.
+        """
         pass
 
     async def register_video_destination(self, destination: str):
+        """Register a video output destination.
+
+        Args:
+            destination: The destination identifier to register.
+        """
         pass
 
     async def register_audio_destination(self, destination: str):
+        """Register an audio output destination.
+
+        Args:
+            destination: The destination identifier to register.
+        """
         pass
 
     async def write_video_frame(self, frame: OutputImageRawFrame):
+        """Write a video frame to the transport.
+
+        Args:
+            frame: The output video frame to write.
+        """
         pass
 
     async def write_audio_frame(self, frame: OutputAudioRawFrame):
+        """Write an audio frame to the transport.
+
+        Args:
+            frame: The output audio frame to write.
+        """
         pass
 
     async def write_dtmf(self, frame: OutputDTMFFrame | OutputDTMFUrgentFrame):
-        pass
+        """Write a DTMF tone using the transport's preferred method.
+
+        Args:
+            frame: The DTMF frame to write.
+        """
+        if self._supports_native_dtmf():
+            await self._write_dtmf_native(frame)
+        else:
+            await self._write_dtmf_audio(frame)
+
+    def _supports_native_dtmf(self) -> bool:
+        """Override in transport implementations that support native DTMF.
+
+        Returns:
+            True if the transport supports native DTMF, False otherwise.
+        """
+        return False
+
+    async def _write_dtmf_native(self, frame: OutputDTMFFrame | OutputDTMFUrgentFrame):
+        """Override in transport implementations for native DTMF.
+
+        Args:
+            frame: The DTMF frame to write.
+        """
+        raise NotImplementedError("Transport claims native DTMF support but doesn't implement it")
+
+    async def _write_dtmf_audio(self, frame: OutputDTMFFrame | OutputDTMFUrgentFrame):
+        """Generate and send audio tones for DTMF.
+
+        Args:
+            frame: The DTMF frame to write.
+        """
+        dtmf_audio = await load_dtmf_audio(frame.button, sample_rate=self._sample_rate)
+        dtmf_audio_frame = OutputAudioRawFrame(
+            audio=dtmf_audio, sample_rate=self._sample_rate, num_channels=1
+        )
+        await self.write_audio_frame(dtmf_audio_frame)
 
     async def send_audio(self, frame: OutputAudioRawFrame):
+        """Send an audio frame downstream.
+
+        Args:
+            frame: The audio frame to send.
+        """
         await self.queue_frame(frame, FrameDirection.DOWNSTREAM)
 
     async def send_image(self, frame: OutputImageRawFrame | SpriteFrame):
+        """Send an image frame downstream.
+
+        Args:
+            frame: The image frame to send.
+        """
         await self.queue_frame(frame, FrameDirection.DOWNSTREAM)
 
     #
@@ -155,12 +278,17 @@ class BaseOutputTransport(FrameProcessor):
     #
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
+        """Process incoming frames and handle transport-specific logic.
+
+        Args:
+            frame: The frame to process.
+            direction: The direction of frame flow in the pipeline.
+        """
         await super().process_frame(frame, direction)
 
         #
-        # System frames (like StartInterruptionFrame) are pushed
-        # immediately. Other frames require order so they are put in the sink
-        # queue.
+        # System frames (like InterruptionFrame) are pushed immediately. Other
+        # frames require order so they are put in the sink queue.
         #
         if isinstance(frame, StartFrame):
             # Push StartFrame before start(), because we want StartFrame to be
@@ -170,10 +298,12 @@ class BaseOutputTransport(FrameProcessor):
         elif isinstance(frame, CancelFrame):
             await self.cancel(frame)
             await self.push_frame(frame, direction)
-        elif isinstance(frame, (StartInterruptionFrame, StopInterruptionFrame)):
+        elif isinstance(frame, InterruptionFrame):
             await self.push_frame(frame, direction)
             await self._handle_frame(frame)
-        elif isinstance(frame, TransportMessageUrgentFrame):
+        elif isinstance(frame, TransportMessageUrgentFrame) and not isinstance(
+            frame, InputTransportMessageUrgentFrame
+        ):
             await self.send_message(frame)
         elif isinstance(frame, OutputDTMFUrgentFrame):
             await self.write_dtmf(frame)
@@ -200,6 +330,7 @@ class BaseOutputTransport(FrameProcessor):
             await self._handle_frame(frame)
 
     async def _handle_frame(self, frame: Frame):
+        """Handle frames by routing them to appropriate media senders."""
         if frame.transport_destination not in self._media_senders:
             logger.warning(
                 f"{self} destination [{frame.transport_destination}] not registered for frame {frame}"
@@ -208,7 +339,7 @@ class BaseOutputTransport(FrameProcessor):
 
         sender = self._media_senders[frame.transport_destination]
 
-        if isinstance(frame, StartInterruptionFrame):
+        if isinstance(frame, InterruptionFrame):
             await sender.handle_interruptions(frame)
         elif isinstance(frame, OutputAudioRawFrame):
             await sender.handle_audio_frame(frame)
@@ -226,6 +357,12 @@ class BaseOutputTransport(FrameProcessor):
     #
 
     class MediaSender:
+        """Handles media streaming for a specific destination.
+
+        Manages audio and video output processing including buffering, timing,
+        mixing, and frame delivery for a single output destination.
+        """
+
         def __init__(
             self,
             transport: "BaseOutputTransport",
@@ -235,6 +372,15 @@ class BaseOutputTransport(FrameProcessor):
             audio_chunk_size: int,
             params: TransportParams,
         ):
+            """Initialize the media sender.
+
+            Args:
+                transport: The parent transport instance.
+                destination: The destination identifier for this sender.
+                sample_rate: The audio sample rate in Hz.
+                audio_chunk_size: The size of audio chunks in bytes.
+                params: Transport configuration parameters.
+            """
             self._transport = transport
             self._destination = destination
             self._sample_rate = sample_rate
@@ -248,7 +394,7 @@ class BaseOutputTransport(FrameProcessor):
             self._audio_buffer = bytearray()
 
             # This will be used to resample incoming audio to the output sample rate.
-            self._resampler = create_default_resampler()
+            self._resampler = create_stream_resampler()
 
             # The user can provide a single mixer, to be used by the default
             # destination, or a destination/mixer mapping.
@@ -266,13 +412,28 @@ class BaseOutputTransport(FrameProcessor):
 
         @property
         def sample_rate(self) -> int:
+            """Get the audio sample rate.
+
+            Returns:
+                The sample rate in Hz.
+            """
             return self._sample_rate
 
         @property
         def audio_chunk_size(self) -> int:
+            """Get the audio chunk size.
+
+            Returns:
+                The size of audio chunks in bytes.
+            """
             return self._audio_chunk_size
 
         async def start(self, frame: StartFrame):
+            """Start the media sender and initialize components.
+
+            Args:
+                frame: The start frame containing initialization parameters.
+            """
             self._audio_buffer = bytearray()
 
             # Create all tasks.
@@ -293,8 +454,13 @@ class BaseOutputTransport(FrameProcessor):
                 await self._mixer.start(self._sample_rate)
 
         async def stop(self, frame: EndFrame):
+            """Stop the media sender and cleanup resources.
+
+            Args:
+                frame: The end frame signaling sender shutdown.
+            """
             # Let the sink tasks process the queue until they reach this EndFrame.
-            await self._clock_queue.put((sys.maxsize, frame.id, frame))
+            await self._clock_queue.put((float("inf"), frame.id, frame))
             await self._audio_queue.put(frame)
 
             # At this point we have enqueued an EndFrame and we need to wait for
@@ -302,9 +468,9 @@ class BaseOutputTransport(FrameProcessor):
             # also need to wait for these tasks before cancelling the video task
             # because it might be still rendering.
             if self._audio_task:
-                await self._transport.wait_for_task(self._audio_task)
+                await self._audio_task
             if self._clock_task:
-                await self._transport.wait_for_task(self._clock_task)
+                await self._clock_task
 
             # Stop audio mixer.
             if self._mixer:
@@ -314,12 +480,22 @@ class BaseOutputTransport(FrameProcessor):
             await self._cancel_video_task()
 
         async def cancel(self, frame: CancelFrame):
+            """Cancel the media sender and stop all processing.
+
+            Args:
+                frame: The cancel frame signaling immediate cancellation.
+            """
             # Since we are cancelling everything it doesn't matter what task we cancel first.
             await self._cancel_audio_task()
             await self._cancel_clock_task()
             await self._cancel_video_task()
 
-        async def handle_interruptions(self, _: StartInterruptionFrame):
+        async def handle_interruptions(self, _: InterruptionFrame):
+            """Handle interruption events by restarting tasks and clearing buffers.
+
+            Args:
+                _: The start interruption frame (unused).
+            """
             if not self._transport.interruptions_allowed:
                 return
 
@@ -335,6 +511,11 @@ class BaseOutputTransport(FrameProcessor):
             await self._bot_stopped_speaking()
 
         async def handle_audio_frame(self, frame: OutputAudioRawFrame):
+            """Handle incoming audio frames by buffering and chunking.
+
+            Args:
+                frame: The output audio frame to handle.
+            """
             if not self._params.audio_out_enabled:
                 return
 
@@ -357,6 +538,11 @@ class BaseOutputTransport(FrameProcessor):
                 self._audio_buffer = self._audio_buffer[self._audio_chunk_size :]
 
         async def handle_image_frame(self, frame: OutputImageRawFrame | SpriteFrame):
+            """Handle incoming image frames for video output.
+
+            Args:
+                frame: The output image or sprite frame to handle.
+            """
             if not self._params.video_out_enabled:
                 return
 
@@ -368,12 +554,27 @@ class BaseOutputTransport(FrameProcessor):
                 await self._set_video_images(frame.images)
 
         async def handle_timed_frame(self, frame: Frame):
+            """Handle frames with presentation timestamps.
+
+            Args:
+                frame: The frame with timing information to handle.
+            """
             await self._clock_queue.put((frame.pts, frame.id, frame))
 
         async def handle_sync_frame(self, frame: Frame):
+            """Handle frames that need synchronized processing.
+
+            Args:
+                frame: The frame to handle synchronously.
+            """
             await self._audio_queue.put(frame)
 
         async def handle_mixer_control_frame(self, frame: MixerControlFrame):
+            """Handle audio mixer control frames.
+
+            Args:
+                frame: The mixer control frame to handle.
+            """
             if self._mixer:
                 await self._mixer.process_frame(frame)
 
@@ -382,16 +583,19 @@ class BaseOutputTransport(FrameProcessor):
         #
 
         def _create_audio_task(self):
+            """Create the audio processing task."""
             if not self._audio_task:
                 self._audio_queue = asyncio.Queue()
                 self._audio_task = self._transport.create_task(self._audio_task_handler())
 
         async def _cancel_audio_task(self):
+            """Cancel and cleanup the audio processing task."""
             if self._audio_task:
                 await self._transport.cancel_task(self._audio_task)
                 self._audio_task = None
 
         async def _bot_started_speaking(self):
+            """Handle bot started speaking event."""
             if not self._bot_speaking:
                 logger.debug(
                     f"Bot{f' [{self._destination}]' if self._destination else ''} started speaking"
@@ -407,6 +611,7 @@ class BaseOutputTransport(FrameProcessor):
                 self._bot_speaking = True
 
         async def _bot_stopped_speaking(self):
+            """Handle bot stopped speaking event."""
             if self._bot_speaking:
                 logger.debug(
                     f"Bot{f' [{self._destination}]' if self._destination else ''} stopped speaking"
@@ -426,6 +631,11 @@ class BaseOutputTransport(FrameProcessor):
                 self._audio_buffer = bytearray()
 
         async def _handle_frame(self, frame: Frame):
+            """Handle various frame types with appropriate processing.
+
+            Args:
+                frame: The frame to handle.
+            """
             if isinstance(frame, OutputImageRawFrame):
                 await self._set_video_image(frame)
             elif isinstance(frame, SpriteFrame):
@@ -436,16 +646,20 @@ class BaseOutputTransport(FrameProcessor):
                 await self._transport.write_dtmf(frame)
 
         def _next_frame(self) -> AsyncGenerator[Frame, None]:
+            """Generate the next frame for audio processing.
+
+            Returns:
+                An async generator yielding frames for processing.
+            """
+
             async def without_mixer(vad_stop_secs: float) -> AsyncGenerator[Frame, None]:
                 while True:
                     try:
                         frame = await asyncio.wait_for(
                             self._audio_queue.get(), timeout=vad_stop_secs
                         )
-                        self._transport.reset_watchdog()
                         yield frame
                     except asyncio.TimeoutError:
-                        self._transport.reset_watchdog()
                         # Notify the bot stopped speaking upstream if necessary.
                         await self._bot_stopped_speaking()
 
@@ -455,13 +669,11 @@ class BaseOutputTransport(FrameProcessor):
                 while True:
                     try:
                         frame = self._audio_queue.get_nowait()
-                        self._transport.reset_watchdog()
                         if isinstance(frame, OutputAudioRawFrame):
                             frame.audio = await self._mixer.mix(frame.audio)
-                        last_frame_time = time.time()
+                            last_frame_time = time.time()
                         yield frame
                     except asyncio.QueueEmpty:
-                        self._transport.reset_watchdog()
                         # Notify the bot stopped speaking upstream if necessary.
                         diff_time = time.time() - last_frame_time
                         if diff_time > vad_stop_secs:
@@ -473,6 +685,11 @@ class BaseOutputTransport(FrameProcessor):
                             num_channels=self._params.audio_out_channels,
                         )
                         yield frame
+                        # Allow other asyncio tasks to execute by adding a small sleep
+                        # Without this sleep, in task cancellation scenarios, this loop would
+                        # continuously return without any delay, leading to 100% CPU utilization
+                        # and preventing cancel/stop signals from being processed properly
+                        await asyncio.sleep(0)
 
             if self._mixer:
                 return with_mixer(BOT_VAD_STOP_SECS)
@@ -480,16 +697,31 @@ class BaseOutputTransport(FrameProcessor):
                 return without_mixer(BOT_VAD_STOP_SECS)
 
         async def _audio_task_handler(self):
+            """Main audio processing task handler."""
             # Push a BotSpeakingFrame every 200ms, we don't really need to push it
             # at every audio chunk. If the audio chunk is bigger than 200ms, push at
             # every audio chunk.
             TOTAL_CHUNK_MS = self._params.audio_out_10ms_chunks * 10
             BOT_SPEAKING_CHUNK_PERIOD = max(int(200 / TOTAL_CHUNK_MS), 1)
             bot_speaking_counter = 0
+            speech_last_speaking_time = 0
+
             async for frame in self._next_frame():
                 # Notify the bot started speaking upstream if necessary and that
                 # it's actually speaking.
+                is_speaking = False
                 if isinstance(frame, TTSAudioRawFrame):
+                    is_speaking = True
+                elif isinstance(frame, SpeechOutputAudioRawFrame):
+                    if not is_silence(frame.audio):
+                        is_speaking = True
+                        speech_last_speaking_time = time.time()
+                    else:
+                        silence_duration = time.time() - speech_last_speaking_time
+                        if silence_duration > BOT_VAD_STOP_SECS:
+                            await self._bot_stopped_speaking()
+
+                if is_speaking:
                     await self._bot_started_speaking()
                     if bot_speaking_counter % BOT_SPEAKING_CHUNK_PERIOD == 0:
                         await self._transport.push_frame(BotSpeakingFrame())
@@ -518,23 +750,36 @@ class BaseOutputTransport(FrameProcessor):
         #
 
         def _create_video_task(self):
+            """Create the video processing task if video output is enabled."""
             if not self._video_task and self._params.video_out_enabled:
                 self._video_queue = asyncio.Queue()
                 self._video_task = self._transport.create_task(self._video_task_handler())
 
         async def _cancel_video_task(self):
+            """Cancel and cleanup the video processing task."""
             # Stop video output task.
             if self._video_task:
                 await self._transport.cancel_task(self._video_task)
                 self._video_task = None
 
         async def _set_video_image(self, image: OutputImageRawFrame):
+            """Set a single video image for cycling output.
+
+            Args:
+                image: The image frame to cycle for video output.
+            """
             self._video_images = itertools.cycle([image])
 
         async def _set_video_images(self, images: List[OutputImageRawFrame]):
+            """Set multiple video images for cycling output.
+
+            Args:
+                images: The list of image frames to cycle for video output.
+            """
             self._video_images = itertools.cycle(images)
 
         async def _video_task_handler(self):
+            """Main video processing task handler."""
             self._video_start_time = None
             self._video_frame_index = 0
             self._video_frame_duration = 1 / self._params.video_out_framerate
@@ -550,6 +795,7 @@ class BaseOutputTransport(FrameProcessor):
                     await asyncio.sleep(self._video_frame_duration)
 
         async def _video_is_live_handler(self):
+            """Handle live video streaming with frame timing."""
             image = await self._video_queue.get()
 
             # We get the start time as soon as we get the first image.
@@ -575,6 +821,12 @@ class BaseOutputTransport(FrameProcessor):
             self._video_queue.task_done()
 
         async def _draw_image(self, frame: OutputImageRawFrame):
+            """Draw/render an image frame with resizing if needed.
+
+            Args:
+                frame: The image frame to draw.
+            """
+
             def resize_frame(frame: OutputImageRawFrame) -> OutputImageRawFrame:
                 desired_size = (self._params.video_out_width, self._params.video_out_height)
 
@@ -601,16 +853,19 @@ class BaseOutputTransport(FrameProcessor):
         #
 
         def _create_clock_task(self):
+            """Create the clock/timing processing task."""
             if not self._clock_task:
-                self._clock_queue = WatchdogPriorityQueue(self._transport.task_manager)
+                self._clock_queue = asyncio.PriorityQueue()
                 self._clock_task = self._transport.create_task(self._clock_task_handler())
 
         async def _cancel_clock_task(self):
+            """Cancel and cleanup the clock processing task."""
             if self._clock_task:
                 await self._transport.cancel_task(self._clock_task)
                 self._clock_task = None
 
         async def _clock_task_handler(self):
+            """Main clock/timing task handler for timed frame delivery."""
             running = True
             while running:
                 timestamp, _, frame = await self._clock_queue.get()
